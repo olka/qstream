@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "quant4"
+version = "0.1.0"
+description = "File-to-file MXFP4 quantization for large language models"
+requires-python = ">=3.12"
+dependencies = [
+    "torch>=2.0",
+    "safetensors>=0.4",
+]
+
+[project.optional-dependencies]
+calibrate = ["transformers>=4.40"]
+
+[project.scripts]
+quant4-quantize = "scripts.quantize:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["quant4*"]
