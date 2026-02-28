@@ -107,7 +107,7 @@ class TestFusedExpertHandler:
         packed_key, scale_key = self.handler.output_keys(
             "model.layers.0.mlp.experts.gate_up_proj"
         )
-        assert packed_key == "model.layers.0.mlp.experts.gate_up_proj_packed"
+        assert packed_key == "model.layers.0.mlp.experts.gate_up_proj"
         assert scale_key == "model.layers.0.mlp.experts.gate_up_proj_scale"
 
 

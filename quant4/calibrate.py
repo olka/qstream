@@ -187,6 +187,7 @@ class MiniMaxLayerRunner:
 
         with open(self.model_dir / "config.json") as f:
             cfg = json.load(f)
+        cfg = cfg.get("text_config", cfg)
 
         self.hidden_size: int = cfg["hidden_size"]
         self.n_heads: int = cfg["num_attention_heads"]
@@ -439,6 +440,197 @@ class MiniMaxLayerRunner:
             "pre_down": stat_pre_down,
         }
 
+    def run_layer_awq(
+        self,
+        hidden: torch.Tensor,
+        layer_idx: int,
+        exclude_patterns: list[str],
+        scale_percentile: float = 99.5,
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor], float]:
+        """Run one layer with AWQ Hessian-based quantization.
+
+        Mirrors run_layer() but computes block Hessians from input activations
+        at each F.linear call and quantizes weights inline. Forward pass always
+        uses original (unquantized) weights for correct hidden state propagation.
+
+        Returns:
+            (output_hidden, quantized_tensors, layer_error)
+            quantized_tensors: {output_key: tensor} — packed, scales, and
+            passthrough tensors for this layer.
+            layer_error: total Hessian-weighted reconstruction error for this layer.
+        """
+        from .core import BLOCK_SIZE, compute_block_hessian, dequant_mxfp4, quantize_mxfp4
+        from .handlers import _passes_exclude_filter, get_handler
+
+        w = self._load_layer(layer_idx)
+        B, T, H = hidden.shape
+        prefix = f"model.layers.{layer_idx}."
+        quantized: dict[str, torch.Tensor] = {}
+        layer_error = [0.0]
+
+        def _maybe_quantize(full_key: str, weight: torch.Tensor, x_input: torch.Tensor):
+            """Quantize weight using Hessian from x_input, or passthrough."""
+            handler = get_handler(full_key, weight)
+            if handler is not None and handler.should_quantize(full_key, weight, exclude_patterns):
+                w_q = weight
+                x_flat = x_input.reshape(-1, x_input.shape[-1]).to(torch.float32)
+                in_features = w_q.shape[-1]
+                if in_features % BLOCK_SIZE != 0:
+                    pad = BLOCK_SIZE - (in_features % BLOCK_SIZE)
+                    w_q = torch.nn.functional.pad(w_q, (0, pad))
+                    x_flat = torch.nn.functional.pad(x_flat, (0, pad))
+                if x_flat.shape[0] > 0:
+                    hess = compute_block_hessian(x_flat)
+                    packed, scales = quantize_mxfp4(w_q, scale_percentile, hessian=hess)
+                    # Track reconstruction error
+                    recon = dequant_mxfp4(packed, scales, w_q.shape)
+                    dW = (recon - w_q.float()).reshape(-1, hess.shape[0], BLOCK_SIZE)
+                    weighted = torch.einsum('obs,bst->obt', dW, hess)
+                    layer_error[0] += (weighted * dW).sum().item()
+                else:
+                    packed, scales = quantize_mxfp4(w_q, scale_percentile)
+                pk, sk = handler.output_keys(full_key)
+                quantized[pk] = packed.cpu()
+                quantized[sk] = scales.cpu()
+            else:
+                quantized[full_key] = weight.cpu()
+
+        # ------------------------------------------------------------------
+        # 1. Pre-attention RMSNorm
+        # ------------------------------------------------------------------
+        x_attn = _rms_norm(hidden, w["input_layernorm.weight"], self.rms_norm_eps)
+        quantized[f"{prefix}input_layernorm.weight"] = w["input_layernorm.weight"].cpu()
+
+        # ------------------------------------------------------------------
+        # 2. QKV projections (typically excluded by *self_attn* pattern)
+        # ------------------------------------------------------------------
+        _maybe_quantize(f"{prefix}self_attn.q_proj.weight", w["self_attn.q_proj.weight"], x_attn)
+        q = F.linear(x_attn, w["self_attn.q_proj.weight"])
+
+        _maybe_quantize(f"{prefix}self_attn.k_proj.weight", w["self_attn.k_proj.weight"], x_attn)
+        k = F.linear(x_attn, w["self_attn.k_proj.weight"])
+
+        _maybe_quantize(f"{prefix}self_attn.v_proj.weight", w["self_attn.v_proj.weight"], x_attn)
+        v = F.linear(x_attn, w["self_attn.v_proj.weight"])
+
+        # ------------------------------------------------------------------
+        # 3. QK-norm
+        # ------------------------------------------------------------------
+        if "self_attn.q_norm.weight" in w:
+            q = _rms_norm(q, w["self_attn.q_norm.weight"], self.rms_norm_eps)
+            quantized[f"{prefix}self_attn.q_norm.weight"] = w["self_attn.q_norm.weight"].cpu()
+        if "self_attn.k_norm.weight" in w:
+            k = _rms_norm(k, w["self_attn.k_norm.weight"], self.rms_norm_eps)
+            quantized[f"{prefix}self_attn.k_norm.weight"] = w["self_attn.k_norm.weight"].cpu()
+
+        # Reshape
+        q = q.reshape(B, T, self.n_heads, self.head_dim).transpose(1, 2)
+        k = k.reshape(B, T, self.n_kv_heads, self.head_dim).transpose(1, 2)
+        v = v.reshape(B, T, self.n_kv_heads, self.head_dim).transpose(1, 2)
+
+        # ------------------------------------------------------------------
+        # 4. Partial RoPE
+        # ------------------------------------------------------------------
+        cos, sin = _build_rope(T, self.rotary_dim, self.rope_theta, self.device)
+        q_rot, k_rot = _apply_rotary(
+            q[..., :self.rotary_dim], k[..., :self.rotary_dim], cos, sin
+        )
+        q = torch.cat([q_rot, q[..., self.rotary_dim:]], dim=-1)
+        k = torch.cat([k_rot, k[..., self.rotary_dim:]], dim=-1)
+
+        # ------------------------------------------------------------------
+        # 5. GQA expand
+        # ------------------------------------------------------------------
+        if self.n_kv_heads != self.n_heads:
+            repeat = self.n_heads // self.n_kv_heads
+            k = k.repeat_interleave(repeat, dim=1)
+            v = v.repeat_interleave(repeat, dim=1)
+
+        # ------------------------------------------------------------------
+        # 6. Attention
+        # ------------------------------------------------------------------
+        attn_out = F.scaled_dot_product_attention(q, k, v, is_causal=False)
+
+        # ------------------------------------------------------------------
+        # 7. o_proj + residual
+        # ------------------------------------------------------------------
+        post_attn = attn_out.transpose(1, 2).reshape(B, T, self.n_heads * self.head_dim)
+        _maybe_quantize(f"{prefix}self_attn.o_proj.weight", w["self_attn.o_proj.weight"], post_attn)
+        hidden = hidden + F.linear(post_attn, w["self_attn.o_proj.weight"])
+
+        # ------------------------------------------------------------------
+        # 8. Pre-MLP RMSNorm
+        # ------------------------------------------------------------------
+        x_mlp = _rms_norm(hidden, w["post_attention_layernorm.weight"], self.rms_norm_eps)
+        quantized[f"{prefix}post_attention_layernorm.weight"] = w["post_attention_layernorm.weight"].cpu()
+
+        # ------------------------------------------------------------------
+        # 9. Routing
+        # ------------------------------------------------------------------
+        x_flat = x_mlp.reshape(-1, H)
+        router_logits = F.linear(x_flat, w["block_sparse_moe.gate.weight"])
+        quantized[f"{prefix}block_sparse_moe.gate.weight"] = w["block_sparse_moe.gate.weight"].cpu()
+        if "block_sparse_moe.e_score_correction_bias" in w:
+            router_logits = router_logits + w["block_sparse_moe.e_score_correction_bias"]
+            quantized[f"{prefix}block_sparse_moe.e_score_correction_bias"] = w["block_sparse_moe.e_score_correction_bias"].cpu()
+        routing_weights = torch.sigmoid(router_logits.float())
+        topk_weights, topk_indices = torch.topk(
+            routing_weights, self.n_experts_per_tok, dim=-1
+        )
+        topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
+
+        # ------------------------------------------------------------------
+        # 10. Expert dispatch with Hessian quantization
+        # ------------------------------------------------------------------
+        moe_out = torch.zeros_like(x_flat)
+
+        for shard, expert_indices in self._expert_shards[layer_idx].items():
+            with safe_open(str(self.model_dir / shard), framework="pt") as sf:
+                for chunk_start in range(0, len(expert_indices), self.expert_buffer):
+                    chunk = expert_indices[chunk_start : chunk_start + self.expert_buffer]
+                    loaded = {ei: self._load_one_expert(sf, shard, layer_idx, ei) for ei in chunk}
+
+                    for expert_idx, ew in loaded.items():
+                        expert_mask = topk_indices == expert_idx
+                        token_mask = expert_mask.any(dim=-1)
+                        if not token_mask.any():
+                            # No tokens routed — quantize without Hessian
+                            ep = f"{prefix}block_sparse_moe.experts.{expert_idx}."
+                            for wname in ("w1", "w2", "w3"):
+                                _maybe_quantize(f"{ep}{wname}.weight", ew[wname], torch.zeros(0, H, device=self.device))
+                            continue
+
+                        token_indices = token_mask.nonzero(as_tuple=True)[0]
+                        x_e = x_flat[token_indices]
+
+                        ep = f"{prefix}block_sparse_moe.experts.{expert_idx}."
+
+                        # w1 (gate) + w3 (up): input is x_e
+                        _maybe_quantize(f"{ep}w1.weight", ew["w1"], x_e)
+                        _maybe_quantize(f"{ep}w3.weight", ew["w3"], x_e)
+
+                        gate_out = F.linear(x_e, ew["w1"])
+                        up_out = F.linear(x_e, ew["w3"])
+                        pre_down = F.silu(gate_out) * up_out
+
+                        # w2 (down): input is pre_down
+                        _maybe_quantize(f"{ep}w2.weight", ew["w2"], pre_down)
+
+                        down_out = F.linear(pre_down, ew["w2"])
+                        expert_weight = (topk_weights * expert_mask.float()).sum(dim=-1)[token_indices]
+                        moe_out.index_add_(0, token_indices, down_out * expert_weight.unsqueeze(-1))
+
+                    del loaded
+
+        hidden = hidden + moe_out.reshape(B, T, H)
+
+        del w
+        gc.collect()
+        if self.device.type == "cuda":
+            torch.cuda.empty_cache()
+
+        return hidden, quantized, layer_error[0]
+
 
 # ---------------------------------------------------------------------------
 # Qwen3 MoE LayerRunner
@@ -461,6 +653,7 @@ class Qwen3LayerRunner:
 
         with open(self.model_dir / "config.json") as f:
             cfg = json.load(f)
+        cfg = cfg.get("text_config", cfg)
 
         self.hidden_size: int = cfg["hidden_size"]
         self.n_heads: int = cfg["num_attention_heads"]
@@ -476,11 +669,19 @@ class Qwen3LayerRunner:
             "moe_intermediate_size", cfg.get("intermediate_size", 0)
         )
         self.norm_topk_prob: bool = bool(cfg.get("norm_topk_prob", True))
+        self.layer_types: list[str] = cfg.get("layer_types", [])
+        self.attn_output_gate: bool = bool(cfg.get("attn_output_gate", False))
 
         # Build weight_map: tensor_name → shard_filename
         index_path = self.model_dir / "model.safetensors.index.json"
         with open(index_path) as f:
             self._weight_map: dict[str, str] = json.load(f)["weight_map"]
+
+        # Detect model prefix (multimodal models nest under model.language_model.*)
+        if "model.language_model.embed_tokens.weight" in self._weight_map:
+            self._model_prefix = "model.language_model."
+        else:
+            self._model_prefix = "model."
 
         # Detect FP8 input
         sample_shard = next(iter(set(self._weight_map.values())))
@@ -512,7 +713,7 @@ class Qwen3LayerRunner:
         all tensors as float32 on self.device.
         FP8 weights are dequantized inline using block scales.
         """
-        prefix = f"model.layers.{layer_idx}."
+        prefix = f"{self._model_prefix}layers.{layer_idx}."
         layer_keys = [k for k in self._weight_map if k.startswith(prefix)]
 
         scale_inv_keys = {k for k in layer_keys if k.endswith(".weight_scale_inv")}
@@ -543,8 +744,8 @@ class Qwen3LayerRunner:
 
     def embed(self, token_ids: torch.Tensor) -> torch.Tensor:
         """token_ids [B, T] → hidden [B, T, hidden_size] float32."""
-        embed_key = "model.embed_tokens.weight"
-        scale_key = "model.embed_tokens.weight_scale_inv"
+        embed_key = f"{self._model_prefix}embed_tokens.weight"
+        scale_key = f"{self._model_prefix}embed_tokens.weight_scale_inv"
 
         keys = [embed_key]
         if scale_key in self._weight_map:
@@ -718,3 +919,237 @@ class Qwen3LayerRunner:
             "pre_mlp": stat_pre_mlp,
             "pre_down": stat_pre_down,
         }
+
+    def run_layer_awq(
+        self,
+        hidden: torch.Tensor,
+        layer_idx: int,
+        exclude_patterns: list[str],
+        scale_percentile: float = 99.5,
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor], float]:
+        """Run one layer with AWQ Hessian-based quantization.
+
+        Mirrors run_layer() but computes block Hessians at each F.linear call
+        and quantizes weights inline. Forward pass uses original weights.
+
+        Returns:
+            (output_hidden, quantized_tensors, layer_error)
+        """
+        from .core import BLOCK_SIZE, compute_block_hessian, dequant_mxfp4, quantize_mxfp4
+        from .handlers import _passes_exclude_filter, get_handler
+
+        w = self._load_layer(layer_idx)
+        B, T, H = hidden.shape
+        prefix = f"{self._model_prefix}layers.{layer_idx}."
+        quantized: dict[str, torch.Tensor] = {}
+        layer_error = [0.0]
+
+        def _maybe_quantize(full_key: str, weight: torch.Tensor, x_input: torch.Tensor):
+            handler = get_handler(full_key, weight)
+            if handler is not None and handler.should_quantize(full_key, weight, exclude_patterns):
+                w_q = weight
+                x_flat = x_input.reshape(-1, x_input.shape[-1]).to(torch.float32)
+                in_features = w_q.shape[-1]
+                if in_features % BLOCK_SIZE != 0:
+                    pad = BLOCK_SIZE - (in_features % BLOCK_SIZE)
+                    w_q = torch.nn.functional.pad(w_q, (0, pad))
+                    x_flat = torch.nn.functional.pad(x_flat, (0, pad))
+                if x_flat.shape[0] > 0:
+                    hess = compute_block_hessian(x_flat)
+                    packed, scales = quantize_mxfp4(w_q, scale_percentile, hessian=hess)
+                    # Track reconstruction error
+                    recon = dequant_mxfp4(packed, scales, w_q.shape)
+                    dW = (recon - w_q.float()).reshape(-1, hess.shape[0], BLOCK_SIZE)
+                    weighted = torch.einsum('obs,bst->obt', dW, hess)
+                    layer_error[0] += (weighted * dW).sum().item()
+                else:
+                    packed, scales = quantize_mxfp4(w_q, scale_percentile)
+                pk, sk = handler.output_keys(full_key)
+                quantized[pk] = packed.cpu()
+                quantized[sk] = scales.cpu()
+            else:
+                quantized[full_key] = weight.cpu()
+
+        # ------------------------------------------------------------------
+        # 1. Pre-attention: branch on layer type
+        # ------------------------------------------------------------------
+        quantized[f"{prefix}input_layernorm.weight"] = w["input_layernorm.weight"].cpu()
+        layer_type = self.layer_types[layer_idx] if layer_idx < len(self.layer_types) else "full_attention"
+
+        if layer_type == "full_attention":
+            x_attn = _rms_norm(hidden, w["input_layernorm.weight"], self.rms_norm_eps)
+
+            _maybe_quantize(f"{prefix}self_attn.q_proj.weight", w["self_attn.q_proj.weight"], x_attn)
+            q_out = F.linear(x_attn, w["self_attn.q_proj.weight"], w.get("self_attn.q_proj.bias"))
+            if "self_attn.q_proj.bias" in w:
+                quantized[f"{prefix}self_attn.q_proj.bias"] = w["self_attn.q_proj.bias"].cpu()
+
+            _maybe_quantize(f"{prefix}self_attn.k_proj.weight", w["self_attn.k_proj.weight"], x_attn)
+            k = F.linear(x_attn, w["self_attn.k_proj.weight"], w.get("self_attn.k_proj.bias"))
+            if "self_attn.k_proj.bias" in w:
+                quantized[f"{prefix}self_attn.k_proj.bias"] = w["self_attn.k_proj.bias"].cpu()
+
+            _maybe_quantize(f"{prefix}self_attn.v_proj.weight", w["self_attn.v_proj.weight"], x_attn)
+            v = F.linear(x_attn, w["self_attn.v_proj.weight"], w.get("self_attn.v_proj.bias"))
+            if "self_attn.v_proj.bias" in w:
+                quantized[f"{prefix}self_attn.v_proj.bias"] = w["self_attn.v_proj.bias"].cpu()
+
+            # Split q_out into q_attn and optional gate
+            kv_heads = k.shape[-1] // self.head_dim
+            attn_dim = self.n_heads * self.head_dim
+            if self.attn_output_gate and q_out.shape[-1] == 2 * attn_dim:
+                q, attn_gate = q_out[..., :attn_dim], q_out[..., attn_dim:]
+            else:
+                q, attn_gate = q_out, None
+
+            q_heads = q.shape[-1] // self.head_dim
+            q = q.reshape(B, T, q_heads, self.head_dim).transpose(1, 2)
+            k = k.reshape(B, T, kv_heads, self.head_dim).transpose(1, 2)
+            v = v.reshape(B, T, kv_heads, self.head_dim).transpose(1, 2)
+
+            if "self_attn.q_norm.weight" in w:
+                q = _rms_norm(q, w["self_attn.q_norm.weight"], self.rms_norm_eps)
+                quantized[f"{prefix}self_attn.q_norm.weight"] = w["self_attn.q_norm.weight"].cpu()
+            if "self_attn.k_norm.weight" in w:
+                k = _rms_norm(k, w["self_attn.k_norm.weight"], self.rms_norm_eps)
+                quantized[f"{prefix}self_attn.k_norm.weight"] = w["self_attn.k_norm.weight"].cpu()
+
+            cos, sin = _build_rope(T, self.head_dim, self.rope_theta, self.device)
+            q, k = _apply_rotary(q, k, cos, sin)
+
+            if kv_heads != q_heads:
+                repeat = q_heads // kv_heads
+                k = k.repeat_interleave(repeat, dim=1)
+                v = v.repeat_interleave(repeat, dim=1)
+
+            attn_out = F.scaled_dot_product_attention(q, k, v, is_causal=False)
+            post_attn = attn_out.transpose(1, 2).reshape(B, T, q_heads * self.head_dim)
+
+            if attn_gate is not None:
+                post_attn = post_attn * F.silu(attn_gate)
+
+            _maybe_quantize(f"{prefix}self_attn.o_proj.weight", w["self_attn.o_proj.weight"], post_attn)
+            hidden = hidden + F.linear(post_attn, w["self_attn.o_proj.weight"], w.get("self_attn.o_proj.bias"))
+            if "self_attn.o_proj.bias" in w:
+                quantized[f"{prefix}self_attn.o_proj.bias"] = w["self_attn.o_proj.bias"].cpu()
+
+        else:
+            # linear_attention (Mamba/SSM): copy weights as passthrough, no hidden update
+            for k_name in list(w.keys()):
+                if k_name.startswith("linear_attn."):
+                    quantized[f"{prefix}{k_name}"] = w[k_name].cpu()
+
+        # ------------------------------------------------------------------
+        # 2. Pre-MLP RMSNorm
+        # ------------------------------------------------------------------
+        x_mlp = _rms_norm(hidden, w["post_attention_layernorm.weight"], self.rms_norm_eps)
+        quantized[f"{prefix}post_attention_layernorm.weight"] = w["post_attention_layernorm.weight"].cpu()
+
+        x_flat = x_mlp.reshape(-1, H)
+        moe_out = torch.zeros_like(x_flat)
+
+        # ------------------------------------------------------------------
+        # 3. MoE routing
+        # ------------------------------------------------------------------
+        if "mlp.gate.weight" in w:
+            router_logits = F.linear(x_flat, w["mlp.gate.weight"])
+            quantized[f"{prefix}mlp.gate.weight"] = w["mlp.gate.weight"].cpu()
+            routing_weights = torch.softmax(router_logits.float(), dim=-1)
+            topk_weights, topk_indices = torch.topk(routing_weights, self.n_experts_per_tok, dim=-1)
+            if self.norm_topk_prob:
+                topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
+
+            # ------------------------------------------------------------------
+            # 4. Expert dispatch
+            # ------------------------------------------------------------------
+            if "mlp.experts.gate_up_proj" in w:
+                # Packed format: [E, 2*I, H] and [E, H, I]
+                gate_up_all = w["mlp.experts.gate_up_proj"]
+                down_all = w["mlp.experts.down_proj"]
+                E = gate_up_all.shape[0]
+                half = gate_up_all.shape[1] // 2
+
+                # Quantize packed tensors as 2D slabs
+                E2I, Hd = gate_up_all.shape[1], gate_up_all.shape[2]
+                _maybe_quantize(f"{prefix}mlp.experts.gate_up_proj",
+                                gate_up_all.reshape(E * E2I, Hd), x_flat)
+                EH, EI = down_all.shape[1], down_all.shape[2]
+                _maybe_quantize(f"{prefix}mlp.experts.down_proj",
+                                down_all.reshape(E * EH, EI),
+                                torch.zeros(0, EI, device=self.device))
+
+                for expert_idx in range(E):
+                    expert_mask = topk_indices == expert_idx
+                    token_mask = expert_mask.any(dim=-1)
+                    if not token_mask.any():
+                        continue
+                    token_indices = token_mask.nonzero(as_tuple=True)[0]
+                    x_e = x_flat[token_indices]
+                    gate_w = gate_up_all[expert_idx, :half]
+                    up_w = gate_up_all[expert_idx, half:]
+                    down_w = down_all[expert_idx]
+                    pre_down = F.silu(F.linear(x_e, gate_w)) * F.linear(x_e, up_w)
+                    down_out = F.linear(pre_down, down_w)
+                    expert_weight = (topk_weights * expert_mask.float()).sum(dim=-1)[token_indices]
+                    moe_out.index_add_(0, token_indices, down_out * expert_weight.unsqueeze(-1))
+
+            else:
+                # Per-expert format: mlp.experts.{idx}.{gate,up,down}_proj.weight
+                for expert_idx in range(self.n_experts):
+                    ep_short = f"mlp.experts.{expert_idx}."
+                    gate_w = w.get(f"{ep_short}gate_proj.weight")
+                    if gate_w is None:
+                        continue
+                    up_w = w[f"{ep_short}up_proj.weight"]
+                    down_w = w[f"{ep_short}down_proj.weight"]
+                    expert_mask = topk_indices == expert_idx
+                    token_mask = expert_mask.any(dim=-1)
+                    ep = f"{prefix}{ep_short}"
+                    if not token_mask.any():
+                        _maybe_quantize(f"{ep}gate_proj.weight", gate_w, torch.zeros(0, H, device=self.device))
+                        _maybe_quantize(f"{ep}up_proj.weight", up_w, torch.zeros(0, H, device=self.device))
+                        _maybe_quantize(f"{ep}down_proj.weight", down_w, torch.zeros(0, self.moe_intermediate_size, device=self.device))
+                        continue
+                    token_indices = token_mask.nonzero(as_tuple=True)[0]
+                    x_e = x_flat[token_indices]
+                    _maybe_quantize(f"{ep}gate_proj.weight", gate_w, x_e)
+                    _maybe_quantize(f"{ep}up_proj.weight", up_w, x_e)
+                    gate_out = F.linear(x_e, gate_w)
+                    up_out = F.linear(x_e, up_w)
+                    pre_down = F.silu(gate_out) * up_out
+                    _maybe_quantize(f"{ep}down_proj.weight", down_w, pre_down)
+                    down_out = F.linear(pre_down, down_w)
+                    expert_weight = (topk_weights * expert_mask.float()).sum(dim=-1)[token_indices]
+                    moe_out.index_add_(0, token_indices, down_out * expert_weight.unsqueeze(-1))
+
+        # ------------------------------------------------------------------
+        # 5. Shared expert (if present)
+        # ------------------------------------------------------------------
+        if "mlp.shared_expert.gate_proj.weight" in w:
+            sg_w = w["mlp.shared_expert.gate_proj.weight"]
+            su_w = w["mlp.shared_expert.up_proj.weight"]
+            sd_w = w["mlp.shared_expert.down_proj.weight"]
+            for k_name in ["mlp.shared_expert.gate_proj.weight",
+                            "mlp.shared_expert.up_proj.weight",
+                            "mlp.shared_expert.down_proj.weight"]:
+                quantized[f"{prefix}{k_name}"] = w[k_name].cpu()
+            shared_pre = F.silu(F.linear(x_flat, sg_w)) * F.linear(x_flat, su_w)
+            shared_out = F.linear(shared_pre, sd_w)
+            if "mlp.shared_expert_gate.weight" in w:
+                quantized[f"{prefix}mlp.shared_expert_gate.weight"] = w["mlp.shared_expert_gate.weight"].cpu()
+                gate_scale = torch.sigmoid(F.linear(x_flat, w["mlp.shared_expert_gate.weight"]))
+                moe_out = gate_scale * shared_out + moe_out
+            else:
+                moe_out = moe_out + shared_out
+
+        # ------------------------------------------------------------------
+        # 6. MoE residual
+        # ------------------------------------------------------------------
+        hidden = hidden + moe_out.reshape(B, T, H)
+
+        del w
+        gc.collect()
+        if self.device.type == "cuda":
+            torch.cuda.empty_cache()
+
+        return hidden, quantized, layer_error[0]

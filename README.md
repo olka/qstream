@@ -83,24 +83,36 @@ The naive approach picks the scale exponent by rounding `log2(block_max / 6)`. T
 Instead, quant4 tries three candidate exponents `{floor−1, floor, floor+1}` per block and picks the one minimizing mean squared quantization error:
 
 ```
+block_max = amax(|w_block|)          # always unweighted
+floor     = floor(log2(block_max / 6))
+
 for k in {floor-1, floor, floor+1}:
     dequant = round_mxfp4(w / 2^k) * 2^k
-    mse[k]  = mean((dequant - w)²)
+    mse[k]  = mean(γ² · (dequant - w)²)   # γ²=1 if no activation stats
 
 best_k = argmin(mse)
 ```
 
 All three candidates are evaluated in a single vectorized pass — no per-block Python loops.
 
+**Why block_max uses unweighted amax:** using a γ-weighted percentile for block_max suppresses outlier input channels, pushing the candidate range too low and causing catastrophic scale underselection (0.66 dB worst-block SNR vs 8+ dB with amax). γ is useful for *choosing between* valid candidates, not for determining what the candidates are.
+
+### Overflow correction
+
+After MSE selects the best exponent, any remaining overflow is corrected. Two cases are distinguished:
+
+- **Benign overflow** (`raw_exp == safe_exp − 1`): the selected exponent is one step below safe. At this scale, `block_max / scale` is at most 12×, and saturation at FP4_max=6 gives the same reconstruction as rounding at the next-larger scale. The MSE decision is correct; no correction is applied.
+- **Catastrophic overflow** (`raw_exp < safe_exp − 1`): the selected exponent is two or more steps below safe. This happens when γ²-weighted MSE strongly favors smaller scales for typical channels while ignoring an outlier. The exponent is corrected to `safe_exp = ceil(log2(block_max / 6))`.
+
 ### Activation-aware scale selection
 
-Quantization error matters most for channels with large activations. quant4 weights the MSE by per-channel activation magnitude γ:
+When activation statistics are available, the MSE candidate evaluation is weighted by per-channel activation magnitude γ:
 
 ```
 mse_weighted[k] = mean(γ² · (dequant - w)²)
 ```
 
-This drives scale selection toward minimizing error for high-activation channels, at the cost of precision for near-zero channels.
+This shifts scale selection to minimize error on high-activation channels at the cost of near-zero channels, without affecting which candidate exponents are evaluated. Empirically this reduces median relative error and tightens the error distribution vs. unweighted MSE.
 
 **Two sources for γ, in priority order:**
 
@@ -127,9 +139,9 @@ For BF16 input models, quant4 symlinks unchanged shards (embedding, attention) a
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--workers` | 4 | Parallel shard workers |
-| `--scale_percentile` | 99.5 | Percentile for initial block_max anchor |
+| `--scale_percentile` | 99.5 | Percentile for unweighted block_max (100 = true amax) |
 | `--exclude_layers` | see below | Substring patterns for tensors to skip |
-| `--no_activation_aware` | off | Disable γ-weighted MSE, use unweighted MSE |
+| `--no_activation_aware` | off | Disable γ-weighted MSE, use plain unweighted MSE |
 | `--calibration_stats` | none | Path to `stats.json` from `calibrate.py`; overrides γ proxy |
 | `--device` | cpu | Device for quantization kernel (`cpu` or `cuda`) |
 | `--fp8_block_size` | 128 | FP8 dequantization block size |

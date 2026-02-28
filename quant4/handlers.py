@@ -108,9 +108,19 @@ class FusedExpertHandler:
         """Cast to BF16 on device. FP8 not supported for fused experts."""
         return tensor.to(device, torch.bfloat16)
 
+    @staticmethod
+    def interleave_gate_up(tensor: torch.Tensor) -> torch.Tensor:
+        """Convert contiguous [gate | up] to gpt-oss interleaved [g0,u0,g1,u1,...].
+
+        Input shape: [E, 2*N, K] with first N rows = gate, last N = up.
+        Output shape: [E, 2*N, K] with rows alternating gate/up.
+        """
+        gate, up = tensor.chunk(2, dim=1)
+        return torch.stack([gate, up], dim=2).reshape(tensor.shape)
+
     def output_keys(self, key: str) -> tuple[str, str]:
         """Return (packed_key, scale_key) — append suffix to bare key."""
-        return (key + "_packed", key + "_scale")
+        return (key, key + "_scale")
 
 
 # Handler registry — checked in order, first match wins.

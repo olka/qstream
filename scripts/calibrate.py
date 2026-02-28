@@ -68,6 +68,7 @@ def main():
 
     with open(model_dir / "config.json") as f:
         config = json.load(f)
+    config = config.get("text_config", config)
     n_layers = config.get("num_hidden_layers") or config.get("n_layers")
 
     stats = collect_activation_stats(runner, token_ids, n_layers=n_layers)

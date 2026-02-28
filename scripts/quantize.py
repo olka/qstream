@@ -1,15 +1,23 @@
 """CLI: file-to-file MXFP4 quantization.
 
-Usage:
+Usage (shard-parallel):
     python scripts/quantize.py \\
         --model_dir /path/to/model \\
         --output_dir /path/to/output \\
         --workers 8
 
+Usage (AWQ calibrated):
+    python scripts/quantize.py \\
+        --model_dir /path/to/model \\
+        --output_dir /path/to/output \\
+        --calibrate --corpus calibration.txt \\
+        --model_family minimax --n_tokens 2048
+
 Flags:
     --no_activation_aware   Disable γ-weighted MSE (unweighted MSE only).
     --scale_percentile N    Anchor percentile for MSE candidate generation (default 99.5).
     --exclude_layers ...    Substring patterns for tensors to skip.
+    --calibrate             AWQ Hessian calibration mode (fused calibration + quantization).
 """
 
 import argparse
@@ -59,6 +67,23 @@ def main():
     parser.add_argument("--no_zero_copy", action="store_true",
                         help="Disable zero-copy passthrough: read/write all tensors "
                              "(original behavior, slower but no symlinks)")
+    # AWQ calibration mode
+    parser.add_argument("--calibrate", action="store_true",
+                        help="AWQ-style Hessian calibration: run forward pass and "
+                             "quantize inline. Requires --corpus and --model_family.")
+    parser.add_argument("--corpus", default=None,
+                        help="Plain text file for calibration (required with --calibrate)")
+    parser.add_argument("--model_family", choices=["qwen3", "minimax"], default=None,
+                        help="Model family for LayerRunner (required with --calibrate)")
+    parser.add_argument("--n_tokens", type=int, default=512,
+                        help="Number of calibration tokens (with --calibrate)")
+    parser.add_argument("--expert_buffer", type=int, default=32,
+                        help="Experts loaded at once (MiniMax only, with --calibrate). "
+                             "Peak RAM ≈ expert_buffer × 54 MB.")
+    parser.add_argument("--keep_fp8_layers", type=int, default=0,
+                        help="Keep N most sensitive layers at original precision "
+                             "(FP8/BF16) instead of MXFP4. Requires --calibrate. "
+                             "Adds modules_to_not_convert to quantization_config.")
     args = parser.parse_args()
 
     if args.threads_per_worker == 0:
@@ -66,6 +91,63 @@ def main():
 
     model_dir = Path(args.model_dir)
     output_dir = Path(args.output_dir)
+
+    # ---------------------------------------------------------------
+    # AWQ calibration mode: fused calibration + quantization
+    # ---------------------------------------------------------------
+    if args.calibrate:
+        if not args.corpus:
+            parser.error("--calibrate requires --corpus")
+        if not args.model_family:
+            parser.error("--calibrate requires --model_family")
+
+        try:
+            from transformers import AutoTokenizer
+        except ImportError:
+            raise ImportError("transformers required for --calibrate: pip install transformers")
+
+        from quant4.awq import run_awq_pipeline
+        from quant4.calibrate import MiniMaxLayerRunner, Qwen3LayerRunner
+
+        tokenizer = AutoTokenizer.from_pretrained(str(model_dir))
+        with open(args.corpus) as f:
+            text = f.read(args.n_tokens * 6)  # rough char estimate
+        token_ids = tokenizer(
+            text, return_tensors="pt", truncation=True, max_length=args.n_tokens
+        ).input_ids
+
+        RUNNERS = {"qwen3": Qwen3LayerRunner, "minimax": MiniMaxLayerRunner}
+        runner_cls = RUNNERS[args.model_family]
+        runner_kwargs = {"device": args.device}
+        if args.model_family == "minimax":
+            runner_kwargs["expert_buffer"] = args.expert_buffer
+        processor = runner_cls(model_dir, **runner_kwargs)
+
+        with open(model_dir / "config.json") as f:
+            _cfg = json.load(f)
+        _cfg = _cfg.get("text_config", _cfg)
+        n_layers = _cfg.get("num_hidden_layers")
+
+        print(f"AWQ calibration mode")
+        print(f"  Tokens:          {token_ids.shape[1]}")
+        print(f"  Layers:          {n_layers}")
+        print(f"  Model family:    {args.model_family}")
+        print(f"  Device:          {args.device}")
+        print(f"  Scale percentile:{args.scale_percentile}")
+        print(f"  Exclude:         {args.exclude_layers}")
+        if args.keep_fp8_layers:
+            print(f"  Keep FP8 layers: {args.keep_fp8_layers} most sensitive")
+
+        run_awq_pipeline(
+            processor, token_ids, n_layers, model_dir, output_dir,
+            args.exclude_layers, args.scale_percentile,
+            keep_fp8_layers=args.keep_fp8_layers,
+        )
+        return
+
+    # ---------------------------------------------------------------
+    # Shard-parallel mode (existing path)
+    # ---------------------------------------------------------------
     output_dir.mkdir(parents=True, exist_ok=True)
 
     index_path = model_dir / "model.safetensors.index.json"
@@ -245,46 +327,28 @@ def main():
     config_path = output_dir / "config.json"
     with open(config_path) as f:
         config = json.load(f)
-    def _to_ignore_regex(pattern: str) -> str:
-        # Patterns match safetensor keys (e.g. '*.mlp.gate.' matches
-        # 'model.layers.0.mlp.gate.weight'). For compressed-tensors ignore,
-        # we match vLLM module names. Trailing '.' signals end-of-module:
-        # convert to '$' anchor to avoid matching substrings like gate_proj.
-        clean = pattern.strip("*")
-        if clean.endswith("."):
-            return "re:.*" + clean.rstrip(".") + "$"
-        return "re:.*" + clean + ".*"
-
+    # Modules with plain .weight in the output were not quantized.
+    ignore_modules = sorted(
+        k[: -len(".weight")]
+        for k in final_weight_map
+        if k.endswith(".weight")
+    )
     config["quantization_config"] = {
         "quant_method": "compressed-tensors",
         "format": "mxfp4-pack-quantized",
-        "quantization_status": "compressed",
         "config_groups": {
             "group_0": {
-                "format": "mxfp4-pack-quantized",
+                "targets": ["Linear"],
                 "weights": {
                     "num_bits": 4,
                     "type": "float",
                     "strategy": "group",
                     "group_size": 32,
                     "symmetric": True,
-                    "scale_dtype": "torch.uint8",
-                    "dynamic": False,
-                    "actorder": None,
-                    "block_structure": None,
-                    "observer": "minmax",
-                    "observer_kwargs": {},
-                    "zp_dtype": None,
                 },
-                "targets": ["Linear"],
-                "input_activations": None,
-                "output_activations": None,
             }
         },
-        "ignore": [_to_ignore_regex(p) for p in args.exclude_layers],
-        "kv_cache_scheme": None,
-        "sparsity_config": {},
-        "transform_config": {},
+        "ignore": ignore_modules,
     }
     with open(config_path, "w") as f:
         json.dump(config, f, indent=2)

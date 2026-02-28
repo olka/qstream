@@ -27,6 +27,17 @@ def extract_layer_index(key: str) -> int | None:
     return int(m.group(1)) if m else None
 
 
+def extract_expert_index(key: str) -> int | None:
+    """Extract expert index from a tensor key.
+
+    Works for keys like:
+        model.layers.0.block_sparse_moe.experts.42.w1.weight
+        model.layers.0.mlp.experts.7.gate_proj.weight
+    """
+    m = re.search(r'\.experts\.(\d+)\.', key)
+    return int(m.group(1)) if m else None
+
+
 def load_layernorm_gammas(
     model_dir: Path,
     shard_files: list[str],

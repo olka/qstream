@@ -15,7 +15,12 @@ _libc = ctypes.CDLL("libc.so.6")
 from .core import BLOCK_SIZE, quantize_mxfp4
 from .fp8 import dequant_fp8_block
 from .gamma import extract_layer_index
-from .handlers import _FUSED_EXPERT_PATTERNS, _passes_exclude_filter, get_handler
+from .handlers import (
+    FusedExpertHandler,
+    _FUSED_EXPERT_PATTERNS,
+    _passes_exclude_filter,
+    get_handler,
+)
 
 
 def activation_type_from_key(key: str) -> str | None:
@@ -190,6 +195,8 @@ def process_shard(
                     print(f"  WARNING: Padded {k} by {pad} for BLOCK_SIZE alignment")
 
                 # Resolve γ: activation_stats takes priority over gamma_by_layer.
+                # γ is used only for MSE weighting; block_max always uses unweighted
+                # amax (see core.py) so outlier channels are never suppressed.
                 gamma = None
                 layer_idx = extract_layer_index(k)
                 if activation_stats and layer_idx is not None:
@@ -220,6 +227,11 @@ def process_shard(
                     del packed_list, scales_list
                 else:
                     packed, scales = quantize_mxfp4(weight_bf16, scale_percentile, gamma=g_dev)
+
+                # Interleave gate_up_proj to gpt-oss format [g0,u0,g1,u1,...]
+                if isinstance(handler, FusedExpertHandler) and "gate_up_proj" in k:
+                    packed = FusedExpertHandler.interleave_gate_up(packed)
+                    scales = FusedExpertHandler.interleave_gate_up(scales)
 
                 packed_key, scale_key = handler.output_keys(k)
                 output_tensors[packed_key] = packed.cpu()

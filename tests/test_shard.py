@@ -169,7 +169,7 @@ class TestProcessShard:
                 exclude_patterns=[], input_format="fp16",
             )
 
-            assert "model.layers.0.mlp.experts.gate_up_proj_packed" in result
+            assert "model.layers.0.mlp.experts.gate_up_proj" in result
             assert "model.layers.0.mlp.experts.gate_up_proj_scale" in result
 
     def test_passthrough_excluded(self):
