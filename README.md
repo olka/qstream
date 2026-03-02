@@ -7,8 +7,8 @@ Targets vLLM's compressed-tensors MXFP4 format.
 ## Supported models
 
 Tested on:
-- **Qwen3-Coder-30B-A3B** (FP8 input, MoE with individual expert weights)
-- **Qwen3.5-30B-A3B** (BF16 input, MoE with fused 3D expert tensors)
+- **Qwen3-family** (FP8 input, dense and MoE with individual expert weights)
+- **Qwen3.5-family** (BF16 input, dense and MoE with fused 3D expert tensors)
 - **MiniMax-M2.5** (229B, 256 experts, FP8 input)
 
 Any model with `weight_scale_inv` FP8 block scales or plain FP16/BF16 safetensors should work. Both 2D individual expert weights and 3D fused expert tensors (Qwen3.5-style `experts.gate_up_proj`) are handled.
@@ -28,7 +28,7 @@ qstream-quantize --help
 qstream-quantize \
     --model_dir /path/to/model \
     --output_dir /path/to/output \
-    --workers 8
+    --workers 4
 ```
 
 ### With CUDA acceleration
@@ -37,11 +37,11 @@ qstream-quantize \
 qstream-quantize \
     --model_dir /path/to/model \
     --output_dir /path/to/output \
-    --workers 8 \
+    --workers 4 \
     --device cuda
 ```
 
-### With streaming activation calibration (better quality)
+### With streaming activation calibration (insignificantly better quality)
 
 ```bash
 # Step 1: collect per-channel activation statistics
@@ -182,5 +182,3 @@ Output models use vLLM's compressed-tensors MXFP4 format:
 - Weight tensors: `uint8` packed (two 4-bit codes per byte), key suffix `.weight_packed`
 - Scale tensors: `uint8` e8m0 biased exponents, key suffix `.weight_scale`
 - Config: `compressed-tensors` with `mxfp4-pack-quantized` format
-
-Requires vLLM with MXFP4 support (Blackwell / SM100+ for CUTLASS kernels).
