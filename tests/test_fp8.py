@@ -1,8 +1,8 @@
-"""Tests for quant4.fp8 — FP8 block dequantization."""
+"""Tests for qstream.fp8 — FP8 block dequantization."""
 
 import torch
 
-from quant4.fp8 import dequant_fp8_block
+from qstream.fp8 import dequant_fp8_block
 
 
 class TestDequantFp8Block:

@@ -1,4 +1,4 @@
-"""Tests for quant4.shard — shard processing and classification."""
+"""Tests for qstream.shard — shard processing and classification."""
 
 import json
 import os
@@ -7,7 +7,7 @@ import tempfile
 import torch
 from safetensors.torch import save_file
 
-from quant4.shard import (
+from qstream.shard import (
     activation_type_from_key,
     should_quantize,
     detect_input_format,

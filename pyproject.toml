@@ -3,7 +3,7 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "quant4"
+name = "qstream"
 version = "0.1.0"
 description = "File-to-file MXFP4 quantization for large language models"
 requires-python = ">=3.12"
@@ -16,10 +16,10 @@ dependencies = [
 calibrate = ["transformers>=4.40"]
 
 [project.scripts]
-quant4-quantize = "scripts.quantize:main"
-quant4-calibrate = "scripts.calibrate:main"
-quant4-analyze = "scripts.analyze_quant_error:main"
+qstream-quantize = "scripts.quantize:main"
+qstream-calibrate = "scripts.calibrate:main"
+qstream-analyze = "scripts.analyze_quant_error:main"
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["quant4*", "scripts*"]
+include = ["qstream*", "scripts*"]

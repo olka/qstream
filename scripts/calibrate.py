@@ -7,7 +7,7 @@ Stats format: {layer_idx: {pre_attn, post_attn, pre_mlp, pre_down}}
 Each value is mean(|x|, dim=tokens) over the calibration corpus.
 
 Usage:
-    quant4-calibrate \\
+    qstream-calibrate \\
         --model_dir /path/to/model \\
         --corpus calibration.txt \\
         --output_path calibration_stats.json \\
@@ -19,7 +19,7 @@ import argparse
 import json
 from pathlib import Path
 
-from quant4.calibrate import MiniMaxLayerRunner, ModelConfig, Qwen3LayerRunner, collect_activation_stats
+from qstream.calibrate import MiniMaxLayerRunner, ModelConfig, Qwen3LayerRunner, collect_activation_stats
 
 RUNNERS = {
     "qwen3": Qwen3LayerRunner,
@@ -28,7 +28,7 @@ RUNNERS = {
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Per-layer calibration (quant4)")
+    parser = argparse.ArgumentParser(description="Per-layer calibration (qstream)")
     parser.add_argument("--model_dir", required=True)
     parser.add_argument("--corpus", required=True, help="Plain text file for calibration")
     parser.add_argument("--output_path", default="calibration_stats.json")

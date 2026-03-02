@@ -1,6 +1,6 @@
-"""Tests for quant4.gamma — layernorm weight loading."""
+"""Tests for qstream.gamma — layernorm weight loading."""
 
-from quant4.gamma import extract_layer_index
+from qstream.gamma import extract_layer_index
 
 
 class TestExtractLayerIndex:

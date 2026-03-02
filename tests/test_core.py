@@ -1,9 +1,9 @@
-"""Tests for quant4.core — MXFP4 quantization kernel."""
+"""Tests for qstream.core — MXFP4 quantization kernel."""
 
 import torch
 import pytest
 
-from quant4.core import BLOCK_SIZE, _POS_VALUES, quantize_mxfp4, _round_to_mxfp4
+from qstream.core import BLOCK_SIZE, _POS_VALUES, quantize_mxfp4, _round_to_mxfp4
 
 
 class TestRoundToMxfp4:

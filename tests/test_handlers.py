@@ -1,8 +1,8 @@
-"""Tests for quant4.handlers — tensor handler abstraction."""
+"""Tests for qstream.handlers — tensor handler abstraction."""
 
 import torch
 
-from quant4.handlers import (
+from qstream.handlers import (
     StandardWeightHandler,
     FusedExpertHandler,
     get_handler,

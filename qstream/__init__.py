@@ -1,4 +1,4 @@
-"""quant4 — file-to-file MXFP4 quantization for large language models."""
+"""qstream — streamable FP4 quantization for large language models."""
 
 from .calibrate import ModelConfig
 from .core import BLOCK_SIZE, compute_block_hessian, quantize_mxfp4

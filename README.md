@@ -1,6 +1,6 @@
-# quant4
+# qstream
 
-File-to-file MXFP4 quantization for large language models. Converts FP8 or FP16/BF16 safetensors models to MXFP4 without loading the full model into GPU memory, enabling quantization of models that don't fit on a single machine.
+Streamable FP4 quantization for large language models. Converts FP8 or FP16/BF16 safetensors models to MXFP4 without loading the full model into GPU memory, enabling quantization of models that don't fit on a single machine.
 
 Targets vLLM's compressed-tensors MXFP4 format.
 
@@ -17,9 +17,7 @@ Any model with `weight_scale_inv` FP8 block scales or plain FP16/BF16 safetensor
 
 ```bash
 pip install -e .
-# or without installing:
-cd quant4
-python scripts/quantize.py --help
+qstream-quantize --help
 ```
 
 ## Quick start
@@ -27,7 +25,7 @@ python scripts/quantize.py --help
 ### Basic quantization
 
 ```bash
-python scripts/quantize.py \
+qstream-quantize \
     --model_dir /path/to/model \
     --output_dir /path/to/output \
     --workers 8
@@ -36,7 +34,7 @@ python scripts/quantize.py \
 ### With CUDA acceleration
 
 ```bash
-python scripts/quantize.py \
+qstream-quantize \
     --model_dir /path/to/model \
     --output_dir /path/to/output \
     --workers 8 \
@@ -47,7 +45,7 @@ python scripts/quantize.py \
 
 ```bash
 # Step 1: collect per-channel activation statistics
-python scripts/calibrate.py \
+qstream-calibrate \
     --model_dir /path/to/model \
     --corpus calibration.txt \
     --output_path stats.json \
@@ -55,7 +53,7 @@ python scripts/calibrate.py \
     --n_tokens 512
 
 # Step 2: quantize using real activation stats instead of γ proxy
-python scripts/quantize.py \
+qstream-quantize \
     --model_dir /path/to/model \
     --output_dir /path/to/output \
     --calibration_stats stats.json \
@@ -80,7 +78,7 @@ For FP8 input models, weights are first dequantized using their 128×128 block s
 
 The naive approach picks the scale exponent by rounding `log2(block_max / 6)`. This minimizes overflow but not quantization error — for heavy-tailed blocks, rounding overestimates the needed scale, compressing precision for the bulk of values.
 
-Instead, quant4 tries three candidate exponents `{floor−1, floor, floor+1}` per block and picks the one minimizing mean squared quantization error:
+Instead, qstream tries three candidate exponents `{floor−1, floor, floor+1}` per block and picks the one minimizing mean squared quantization error:
 
 ```
 block_max = amax(|w_block|)          # always unweighted
@@ -130,11 +128,11 @@ Supported model families:
 
 ### Zero-copy mode
 
-For BF16 input models, quant4 symlinks unchanged shards (embedding, attention) and writes only the quantized expert/MLP shards. This reduces I/O significantly when most shards contain only excluded tensors. Enabled automatically when conditions are met; disable with `--no_zero_copy`.
+For BF16 input models, qstream symlinks unchanged shards (embedding, attention) and writes only the quantized expert/MLP shards. This reduces I/O significantly when most shards contain only excluded tensors. Enabled automatically when conditions are met; disable with `--no_zero_copy`.
 
 ## Options
 
-### `scripts/quantize.py`
+### `qstream-quantize`
 
 | Flag | Default | Description |
 |------|---------|-------------|
@@ -142,7 +140,7 @@ For BF16 input models, quant4 symlinks unchanged shards (embedding, attention) a
 | `--scale_percentile` | 99.5 | Percentile for unweighted block_max (100 = true amax) |
 | `--exclude_layers` | see below | Substring patterns for tensors to skip |
 | `--no_activation_aware` | off | Disable γ-weighted MSE, use plain unweighted MSE |
-| `--calibration_stats` | none | Path to `stats.json` from `calibrate.py`; overrides γ proxy |
+| `--calibration_stats` | none | Path to `stats.json` from `qstream-calibrate`; overrides γ proxy |
 | `--device` | cpu | Device for quantization kernel (`cpu` or `cuda`) |
 | `--fp8_block_size` | 128 | FP8 dequantization block size |
 | `--use_zero_copy` | off | Enable symlink passthrough for unchanged shards |
@@ -150,7 +148,7 @@ For BF16 input models, quant4 symlinks unchanged shards (embedding, attention) a
 
 Default exclude patterns: `*self_attn*`, `*.mlp.gate.`, `*lm_head*`, `*embed_tokens*`
 
-### `scripts/calibrate.py`
+### `qstream-calibrate`
 
 | Flag | Default | Description |
 |------|---------|-------------|
@@ -165,8 +163,8 @@ Default exclude patterns: `*self_attn*`, `*.mlp.gate.`, `*lm_head*`, `*embed_tok
 ## Project structure
 
 ```
-quant4/
-├── quant4/
+qstream/
+├── qstream/
 │   ├── core.py         MXFP4 constants, MSE-optimal quantize_mxfp4()
 │   ├── fp8.py          FP8 block dequantization
 │   ├── gamma.py        input_layernorm.weight loading, layer index extraction

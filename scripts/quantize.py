@@ -1,13 +1,13 @@
 """CLI: file-to-file MXFP4 quantization.
 
 Usage:
-    quant4-quantize \\
+    qstream-quantize \\
         --model_dir /path/to/model \\
         --output_dir /path/to/output \\
         --workers 8
 
     # For vLLM fork (fused expert format):
-    quant4-quantize \\
+    qstream-quantize \\
         --model_dir /path/to/model \\
         --output_dir /path/to/output \\
         --format fused
@@ -34,12 +34,12 @@ from pathlib import Path
 _soft, _hard = resource.getrlimit(resource.RLIMIT_NOFILE)
 resource.setrlimit(resource.RLIMIT_NOFILE, (min(_hard, 65536), _hard))
 
-from quant4.gamma import load_layernorm_gammas
-from quant4.shard import classify_shard, detect_input_format, process_shard
+from qstream.gamma import load_layernorm_gammas
+from qstream.shard import classify_shard, detect_input_format, process_shard
 
 
 def main():
-    parser = argparse.ArgumentParser(description="MXFP4 quantization (quant4)")
+    parser = argparse.ArgumentParser(description="MXFP4 quantization (qstream)")
     parser.add_argument("--model_dir", required=True)
     parser.add_argument("--output_dir", required=True)
     parser.add_argument(
