@@ -155,7 +155,7 @@ class TestProcessShard:
             assert "model.layers.0.input_layernorm.weight" in result
             assert os.path.exists(output_path)
 
-    def test_quantizes_3d_fused_experts(self):
+    def test_quantizes_3d_fused_experts_ct(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             input_path = os.path.join(tmpdir, "input.safetensors")
             output_path = os.path.join(tmpdir, "output.safetensors")
@@ -167,8 +167,53 @@ class TestProcessShard:
             result = process_shard(
                 input_path, output_path,
                 exclude_patterns=[], input_format="fp16",
+                output_format="ct",
             )
 
+            # CT format: per-expert separate gate/up tensors
+            for i in range(4):
+                assert f"model.layers.0.mlp.experts.{i}.gate_proj.weight_packed" in result
+                assert f"model.layers.0.mlp.experts.{i}.gate_proj.weight_scale" in result
+                assert f"model.layers.0.mlp.experts.{i}.up_proj.weight_packed" in result
+                assert f"model.layers.0.mlp.experts.{i}.up_proj.weight_scale" in result
+            assert "model.layers.0.mlp.experts.w13_weight" not in result
+
+    def test_quantizes_3d_down_proj_ct(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            input_path = os.path.join(tmpdir, "input.safetensors")
+            output_path = os.path.join(tmpdir, "output.safetensors")
+
+            save_file({
+                "model.layers.0.mlp.experts.down_proj": torch.randn(4, 128, 64, dtype=torch.bfloat16),
+            }, input_path)
+
+            result = process_shard(
+                input_path, output_path,
+                exclude_patterns=[], input_format="fp16",
+                output_format="ct",
+            )
+
+            for i in range(4):
+                assert f"model.layers.0.mlp.experts.{i}.down_proj.weight_packed" in result
+                assert f"model.layers.0.mlp.experts.{i}.down_proj.weight_scale" in result
+            assert "model.layers.0.mlp.experts.w2_weight" not in result
+
+    def test_quantizes_3d_fused_experts_fused(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            input_path = os.path.join(tmpdir, "input.safetensors")
+            output_path = os.path.join(tmpdir, "output.safetensors")
+
+            save_file({
+                "model.layers.0.mlp.experts.gate_up_proj": torch.randn(4, 64, 128, dtype=torch.bfloat16),
+            }, input_path)
+
+            result = process_shard(
+                input_path, output_path,
+                exclude_patterns=[], input_format="fp16",
+                output_format="fused",
+            )
+
+            # Fused format: interleaved w13/w2
             assert "model.layers.0.mlp.experts.w13_weight" in result
             assert "model.layers.0.mlp.experts.w13_weight_scale" in result
 
@@ -186,7 +231,6 @@ class TestProcessShard:
                 exclude_patterns=["*self_attn*"], input_format="fp16",
             )
 
-            # Should pass through as-is, not quantized
             assert "model.layers.0.self_attn.q_proj.weight" in result
             assert "model.layers.0.self_attn.q_proj.weight_packed" not in result
 

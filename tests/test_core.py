@@ -3,7 +3,7 @@
 import torch
 import pytest
 
-from quant4.core import BLOCK_SIZE, quantize_mxfp4, _round_to_mxfp4
+from quant4.core import BLOCK_SIZE, _POS_VALUES, quantize_mxfp4, _round_to_mxfp4
 
 
 class TestRoundToMxfp4:
@@ -68,7 +68,6 @@ class TestQuantizeMxfp4:
     def test_zero_tensor(self):
         t = torch.zeros(32, 64, dtype=torch.bfloat16)
         packed, scales = quantize_mxfp4(t)
-        # All codes should be 0 (zero value)
         assert (packed == 0).all()
 
     def test_scale_percentile_100(self):
@@ -82,8 +81,6 @@ class TestQuantizeMxfp4:
         t = torch.randn(256, 256, dtype=torch.float32)
         packed, scales = quantize_mxfp4(t)
 
-        # Reconstruct: unpack codes and apply scales
-        from quant4.core import _POS_VALUES, BLOCK_SIZE
         lo = packed & 0x0F
         hi = (packed >> 4) & 0x0F
         codes = torch.stack([lo, hi], dim=-1).reshape(256, 256)

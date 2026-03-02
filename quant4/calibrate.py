@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import gc
 import json
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
 
@@ -35,12 +36,71 @@ import torch
 import torch.nn.functional as F
 from safetensors import safe_open
 
+from .core import BLOCK_SIZE, compute_block_hessian, dequant_mxfp4, quantize_mxfp4
 from .fp8 import dequant_fp8_block
+from .handlers import _passes_exclude_filter, get_handler
 
 
-# ---------------------------------------------------------------------------
-# RoPE and norm helpers
-# ---------------------------------------------------------------------------
+def _cfg_first(cfg: dict, *keys: str, default: object = None) -> object:
+    """Return value for the first key found in cfg, or default."""
+    for k in keys:
+        if k in cfg:
+            return cfg[k]
+    return default
+
+
+@dataclass(frozen=True)
+class ModelConfig:
+    """Parsed transformer config from HuggingFace config.json.
+
+    Handles alias variations across model families (Qwen, MiniMax, Mixtral, etc.)
+    and provides typed fields with sensible defaults.
+    """
+
+    hidden_size: int
+    n_heads: int
+    n_kv_heads: int
+    head_dim: int
+    n_layers: int
+    rotary_dim: int
+    rope_theta: float
+    rms_norm_eps: float
+    n_experts: int
+    n_experts_per_tok: int
+    moe_intermediate_size: int
+    norm_topk_prob: bool
+    layer_types: tuple[str, ...]
+    attn_output_gate: bool
+
+    @classmethod
+    def from_json(cls, raw: dict) -> ModelConfig:
+        """Parse from a HuggingFace config.json dict.
+
+        Handles the text_config wrapper (multimodal models) and resolves
+        alias variations across model families.
+        """
+        cfg = raw.get("text_config", raw)
+        hidden_size = cfg["hidden_size"]
+        n_heads = cfg["num_attention_heads"]
+        n_kv_heads = cfg.get("num_key_value_heads", n_heads)
+        head_dim = cfg.get("head_dim", hidden_size // n_heads)
+        return cls(
+            hidden_size=hidden_size,
+            n_heads=n_heads,
+            n_kv_heads=n_kv_heads,
+            head_dim=head_dim,
+            n_layers=_cfg_first(cfg, "num_hidden_layers", "n_layers", default=0),
+            rotary_dim=cfg.get("rotary_dim", head_dim),
+            rope_theta=float(cfg.get("rope_theta", 10000.0)),
+            rms_norm_eps=float(cfg.get("rms_norm_eps", 1e-6)),
+            n_experts=_cfg_first(cfg, "num_local_experts", "num_experts", default=0),
+            n_experts_per_tok=_cfg_first(cfg, "num_experts_per_tok", "num_selected_experts", default=2),
+            moe_intermediate_size=_cfg_first(cfg, "moe_intermediate_size", "intermediate_size", default=0),
+            norm_topk_prob=bool(cfg.get("norm_topk_prob", True)),
+            layer_types=tuple(cfg.get("layer_types", ())),
+            attn_output_gate=bool(cfg.get("attn_output_gate", False)),
+        )
+
 
 def _rms_norm(x: torch.Tensor, weight: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
     """Standard RMSNorm: x / rms(x) * weight."""
@@ -86,10 +146,6 @@ def _build_rope(
     emb = torch.cat([freqs, freqs], dim=-1)  # [T, head_dim]
     return emb.cos()[None], emb.sin()[None]  # [1, T, head_dim]
 
-
-# ---------------------------------------------------------------------------
-# Public interface
-# ---------------------------------------------------------------------------
 
 class LayerRunner(Protocol):
     """Model-specific transformer layer executor.
@@ -162,10 +218,6 @@ def load_calibration_stats(path: str | Path) -> dict[int, dict[str, torch.Tensor
     }
 
 
-# ---------------------------------------------------------------------------
-# Layer runner stubs — implement per model family
-# ---------------------------------------------------------------------------
-
 class MiniMaxLayerRunner:
     """Streaming layer runner for MiniMax-M2.5 (229B, 256 experts, 62 layers).
 
@@ -186,19 +238,18 @@ class MiniMaxLayerRunner:
         self.expert_buffer = expert_buffer
 
         with open(self.model_dir / "config.json") as f:
-            cfg = json.load(f)
-        cfg = cfg.get("text_config", cfg)
+            cfg = ModelConfig.from_json(json.load(f))
 
-        self.hidden_size: int = cfg["hidden_size"]
-        self.n_heads: int = cfg["num_attention_heads"]
-        self.n_kv_heads: int = cfg.get("num_key_value_heads", self.n_heads)
-        self.head_dim: int = cfg.get("head_dim", self.hidden_size // self.n_heads)
-        self.rotary_dim: int = cfg.get("rotary_dim", self.head_dim)
-        self.rope_theta: float = float(cfg.get("rope_theta", 10000.0))
-        self.rms_norm_eps: float = float(cfg.get("rms_norm_eps", 1e-6))
-        self.n_experts: int = cfg.get("num_local_experts", cfg.get("num_experts", 0))
-        self.n_experts_per_tok: int = cfg.get("num_experts_per_tok", 2)
-        self.moe_intermediate_size: int = cfg.get("intermediate_size", 0)
+        self.hidden_size = cfg.hidden_size
+        self.n_heads = cfg.n_heads
+        self.n_kv_heads = cfg.n_kv_heads
+        self.head_dim = cfg.head_dim
+        self.rotary_dim = cfg.rotary_dim
+        self.rope_theta = cfg.rope_theta
+        self.rms_norm_eps = cfg.rms_norm_eps
+        self.n_experts = cfg.n_experts
+        self.n_experts_per_tok = cfg.n_experts_per_tok
+        self.moe_intermediate_size = cfg.moe_intermediate_size
 
         index_path = self.model_dir / "model.safetensors.index.json"
         with open(index_path) as f:
@@ -215,7 +266,7 @@ class MiniMaxLayerRunner:
         # Used for memory-efficient shard-by-shard expert streaming.
         self._expert_shards: dict[int, dict[str, list[int]]] = {}
         ep_base = "model.layers.{}.block_sparse_moe.experts.{}.w1.weight"
-        for li in range(cfg.get("num_hidden_layers", 0)):
+        for li in range(cfg.n_layers):
             shard_map: dict[str, list[int]] = {}
             for ei in range(self.n_experts):
                 key = ep_base.format(li, ei)
@@ -329,7 +380,6 @@ class MiniMaxLayerRunner:
         if "self_attn.k_norm.weight" in w:
             k = _rms_norm(k, w["self_attn.k_norm.weight"], self.rms_norm_eps)
 
-        # Reshape to [B, heads, T, head_dim]
         q = q.reshape(B, T, self.n_heads, self.head_dim).transpose(1, 2)
         k = k.reshape(B, T, self.n_kv_heads, self.head_dim).transpose(1, 2)
         v = v.reshape(B, T, self.n_kv_heads, self.head_dim).transpose(1, 2)
@@ -398,10 +448,8 @@ class MiniMaxLayerRunner:
                 for chunk_start in range(0, len(expert_indices), self.expert_buffer):
                     chunk = expert_indices[chunk_start : chunk_start + self.expert_buffer]
 
-                    # Load buffer
                     loaded = {ei: self._load_one_expert(sf, shard, layer_idx, ei) for ei in chunk}
 
-                    # Process buffer
                     for expert_idx, ew in loaded.items():
                         expert_mask = topk_indices == expert_idx
                         token_mask = expert_mask.any(dim=-1)
@@ -459,8 +507,6 @@ class MiniMaxLayerRunner:
             passthrough tensors for this layer.
             layer_error: total Hessian-weighted reconstruction error for this layer.
         """
-        from .core import BLOCK_SIZE, compute_block_hessian, dequant_mxfp4, quantize_mxfp4
-        from .handlers import _passes_exclude_filter, get_handler
 
         w = self._load_layer(layer_idx)
         B, T, H = hidden.shape
@@ -482,7 +528,6 @@ class MiniMaxLayerRunner:
                 if x_flat.shape[0] > 0:
                     hess = compute_block_hessian(x_flat)
                     packed, scales = quantize_mxfp4(w_q, scale_percentile, hessian=hess)
-                    # Track reconstruction error
                     recon = dequant_mxfp4(packed, scales, w_q.shape)
                     dW = (recon - w_q.float()).reshape(-1, hess.shape[0], BLOCK_SIZE)
                     weighted = torch.einsum('obs,bst->obt', dW, hess)
@@ -523,7 +568,6 @@ class MiniMaxLayerRunner:
             k = _rms_norm(k, w["self_attn.k_norm.weight"], self.rms_norm_eps)
             quantized[f"{prefix}self_attn.k_norm.weight"] = w["self_attn.k_norm.weight"].cpu()
 
-        # Reshape
         q = q.reshape(B, T, self.n_heads, self.head_dim).transpose(1, 2)
         k = k.reshape(B, T, self.n_kv_heads, self.head_dim).transpose(1, 2)
         v = v.reshape(B, T, self.n_kv_heads, self.head_dim).transpose(1, 2)
@@ -632,10 +676,6 @@ class MiniMaxLayerRunner:
         return hidden, quantized, layer_error[0]
 
 
-# ---------------------------------------------------------------------------
-# Qwen3 MoE LayerRunner
-# ---------------------------------------------------------------------------
-
 class Qwen3LayerRunner:
     """Streaming layer runner for Qwen3 MoE models.
 
@@ -652,27 +692,21 @@ class Qwen3LayerRunner:
         self.device = torch.device(device)
 
         with open(self.model_dir / "config.json") as f:
-            cfg = json.load(f)
-        cfg = cfg.get("text_config", cfg)
+            cfg = ModelConfig.from_json(json.load(f))
 
-        self.hidden_size: int = cfg["hidden_size"]
-        self.n_heads: int = cfg["num_attention_heads"]
-        self.n_kv_heads: int = cfg.get("num_key_value_heads", self.n_heads)
-        self.head_dim: int = cfg.get("head_dim", self.hidden_size // self.n_heads)
-        self.rope_theta: float = float(cfg.get("rope_theta", 10000.0))
-        self.rms_norm_eps: float = float(cfg.get("rms_norm_eps", 1e-6))
-        self.n_experts: int = cfg.get("num_experts", cfg.get("num_local_experts", 0))
-        self.n_experts_per_tok: int = cfg.get(
-            "num_experts_per_tok", cfg.get("num_selected_experts", 2)
-        )
-        self.moe_intermediate_size: int = cfg.get(
-            "moe_intermediate_size", cfg.get("intermediate_size", 0)
-        )
-        self.norm_topk_prob: bool = bool(cfg.get("norm_topk_prob", True))
-        self.layer_types: list[str] = cfg.get("layer_types", [])
-        self.attn_output_gate: bool = bool(cfg.get("attn_output_gate", False))
+        self.hidden_size = cfg.hidden_size
+        self.n_heads = cfg.n_heads
+        self.n_kv_heads = cfg.n_kv_heads
+        self.head_dim = cfg.head_dim
+        self.rope_theta = cfg.rope_theta
+        self.rms_norm_eps = cfg.rms_norm_eps
+        self.n_experts = cfg.n_experts
+        self.n_experts_per_tok = cfg.n_experts_per_tok
+        self.moe_intermediate_size = cfg.moe_intermediate_size
+        self.norm_topk_prob = cfg.norm_topk_prob
+        self.layer_types = list(cfg.layer_types)
+        self.attn_output_gate = cfg.attn_output_gate
 
-        # Build weight_map: tensor_name → shard_filename
         index_path = self.model_dir / "model.safetensors.index.json"
         with open(index_path) as f:
             self._weight_map: dict[str, str] = json.load(f)["weight_map"]
@@ -683,7 +717,6 @@ class Qwen3LayerRunner:
         else:
             self._model_prefix = "model."
 
-        # Detect FP8 input
         sample_shard = next(iter(set(self._weight_map.values())))
         with safe_open(str(self.model_dir / sample_shard), framework="pt") as sf:
             self._is_fp8 = any(k.endswith(".weight_scale_inv") for k in sf.keys())
@@ -721,7 +754,6 @@ class Qwen3LayerRunner:
 
         raw = self._load_tensors(layer_keys)
 
-        # Build weight → scale_inv lookup
         scale_inv_lookup = {
             k.replace(".weight_scale_inv", ".weight"): k for k in scale_inv_keys
         }
@@ -795,7 +827,6 @@ class Qwen3LayerRunner:
         v = F.linear(x_attn, w["self_attn.v_proj.weight"],
                      w.get("self_attn.v_proj.bias"))   # [B, T, n_kv_heads * head_dim]
 
-        # Reshape to [B, heads, T, head_dim]
         q = q.reshape(B, T, self.n_heads, self.head_dim).transpose(1, 2)
         k = k.reshape(B, T, self.n_kv_heads, self.head_dim).transpose(1, 2)
         v = v.reshape(B, T, self.n_kv_heads, self.head_dim).transpose(1, 2)
@@ -874,7 +905,6 @@ class Qwen3LayerRunner:
             up_w = w[f"{ep}up_proj.weight"]
             down_w = w[f"{ep}down_proj.weight"]
 
-            # Tokens that route to this expert
             expert_mask = topk_indices == expert_idx     # [N, k] bool
             token_mask = expert_mask.any(dim=-1)          # [N] bool
             if not token_mask.any():
@@ -891,7 +921,6 @@ class Qwen3LayerRunner:
 
             down_out = F.linear(pre_down, down_w)  # [n_tok, H]
 
-            # Routing weight for this expert per selected token
             expert_weight = (topk_weights * expert_mask.float()).sum(dim=-1)
             expert_weight = expert_weight[token_indices]  # [n_tok]
 
@@ -935,8 +964,6 @@ class Qwen3LayerRunner:
         Returns:
             (output_hidden, quantized_tensors, layer_error)
         """
-        from .core import BLOCK_SIZE, compute_block_hessian, dequant_mxfp4, quantize_mxfp4
-        from .handlers import _passes_exclude_filter, get_handler
 
         w = self._load_layer(layer_idx)
         B, T, H = hidden.shape
@@ -957,7 +984,6 @@ class Qwen3LayerRunner:
                 if x_flat.shape[0] > 0:
                     hess = compute_block_hessian(x_flat)
                     packed, scales = quantize_mxfp4(w_q, scale_percentile, hessian=hess)
-                    # Track reconstruction error
                     recon = dequant_mxfp4(packed, scales, w_q.shape)
                     dW = (recon - w_q.float()).reshape(-1, hess.shape[0], BLOCK_SIZE)
                     weighted = torch.einsum('obs,bst->obt', dW, hess)

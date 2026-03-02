@@ -4,6 +4,7 @@ import ctypes
 import gc
 import json
 import os
+import re
 import struct
 
 import torch
@@ -12,6 +13,7 @@ from safetensors.torch import save_file
 
 _libc = ctypes.CDLL("libc.so.6")
 
+from .calibrate import load_calibration_stats
 from .core import BLOCK_SIZE, quantize_mxfp4
 from .fp8 import dequant_fp8_block
 from .gamma import extract_layer_index
@@ -95,7 +97,6 @@ def classify_shard(
         shape = meta["shape"]
         ndim = len(shape)
 
-        # Mirror the handler logic from handlers.py
         would_quantize = False
         if ndim == 3 and _FUSED_EXPERT_PATTERNS.search(key):
             would_quantize = _passes_exclude_filter(key, exclude_patterns)
@@ -153,7 +154,6 @@ def process_shard(
     # Load calibration stats inside the worker — avoids cross-process tensor fd sharing.
     activation_stats = None
     if calibration_stats_path:
-        from .calibrate import load_calibration_stats
         activation_stats = load_calibration_stats(calibration_stats_path)
     output_tensors = {}
     n_quantized = 0
@@ -183,12 +183,10 @@ def process_shard(
             handler = get_handler(k, t)
 
             if handler is not None and handler.should_quantize(k, t, exclude_patterns):
-                # Prepare weight: dequant FP8 or cast to BF16
                 weight_bf16 = handler.prepare_weight(
                     k, t, device, input_format, fp8_block_size, scale_inv_map, f,
                 )
 
-                # Pad last dim to BLOCK_SIZE if needed
                 in_features = weight_bf16.shape[-1]
                 if in_features % BLOCK_SIZE != 0:
                     pad = BLOCK_SIZE - (in_features % BLOCK_SIZE)
@@ -272,7 +270,6 @@ def process_shard(
                     n_quantized += 1
 
             else:
-                # Pass through, dequanting FP8 where needed
                 if input_format == "fp8" and t.dtype == torch.float8_e4m3fn:
                     scale_key = scale_inv_map.get(k)
                     if scale_key is not None:

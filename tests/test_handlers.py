@@ -117,6 +117,27 @@ class TestFusedExpertHandler:
         assert packed_key == "model.layers.0.mlp.experts.w2_weight"
         assert scale_key == "model.layers.0.mlp.experts.w2_weight_scale"
 
+    def test_interleave_gate_up_roundtrip(self):
+        # [E, 2*N, K] with first N=gate, last N=up
+        E, N, K = 4, 8, 16
+        gate = torch.arange(E * N * K).reshape(E, N, K).float()
+        up = torch.arange(100, 100 + E * N * K).reshape(E, N, K).float()
+        contiguous = torch.cat([gate, up], dim=1)  # [E, 2N, K]
+
+        interleaved = FusedExpertHandler.interleave_gate_up(contiguous)
+        assert interleaved.shape == contiguous.shape
+
+        # Verify interleaved pattern: row 0=gate0, row 1=up0, row 2=gate1, ...
+        assert torch.equal(interleaved[:, 0, :], gate[:, 0, :])
+        assert torch.equal(interleaved[:, 1, :], up[:, 0, :])
+        assert torch.equal(interleaved[:, 2, :], gate[:, 1, :])
+        assert torch.equal(interleaved[:, 3, :], up[:, 1, :])
+
+        recovered_gate = interleaved[:, ::2, :]
+        recovered_up = interleaved[:, 1::2, :]
+        recovered = torch.cat([recovered_gate, recovered_up], dim=1)
+        assert torch.equal(recovered, contiguous)
+
 
 class TestGetHandler:
     def test_returns_standard_for_2d_weight(self):

@@ -1,31 +1,31 @@
 """CLI: file-to-file MXFP4 quantization.
 
-Usage (shard-parallel):
-    python scripts/quantize.py \\
+Usage:
+    quant4-quantize \\
         --model_dir /path/to/model \\
         --output_dir /path/to/output \\
         --workers 8
 
-Usage (AWQ calibrated):
-    python scripts/quantize.py \\
+    # For vLLM fork (fused expert format):
+    quant4-quantize \\
         --model_dir /path/to/model \\
         --output_dir /path/to/output \\
-        --calibrate --corpus calibration.txt \\
-        --model_family minimax --n_tokens 2048
+        --format fused
 
 Flags:
+    --format {ct,fused}     Output format: ct (stock vLLM, default) or fused (vLLM fork).
     --no_activation_aware   Disable γ-weighted MSE (unweighted MSE only).
     --scale_percentile N    Anchor percentile for MSE candidate generation (default 99.5).
     --exclude_layers ...    Substring patterns for tensors to skip.
-    --calibrate             AWQ Hessian calibration mode (fused calibration + quantization).
 """
 
 import argparse
 import json
+import multiprocessing as mp
 import os
 import resource
 import shutil
-import sys
+import time
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 
@@ -33,9 +33,6 @@ from pathlib import Path
 # Default soft limit (1024) is too low for large models with many shards and workers.
 _soft, _hard = resource.getrlimit(resource.RLIMIT_NOFILE)
 resource.setrlimit(resource.RLIMIT_NOFILE, (min(_hard, 65536), _hard))
-
-# Allow running as a script without installing the package
-sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from quant4.gamma import load_layernorm_gammas
 from quant4.shard import classify_shard, detect_input_format, process_shard
@@ -68,23 +65,6 @@ def main():
                         help="Enable zero-copy passthrough: symlink shards with only "
                              "passthrough tensors (faster but leaves stale BF16 expert "
                              "tensors in symlinked shards, incompatible with some loaders)")
-    # AWQ calibration mode
-    parser.add_argument("--calibrate", action="store_true",
-                        help="AWQ-style Hessian calibration: run forward pass and "
-                             "quantize inline. Requires --corpus and --model_family.")
-    parser.add_argument("--corpus", default=None,
-                        help="Plain text file for calibration (required with --calibrate)")
-    parser.add_argument("--model_family", choices=["qwen3", "minimax"], default=None,
-                        help="Model family for LayerRunner (required with --calibrate)")
-    parser.add_argument("--n_tokens", type=int, default=512,
-                        help="Number of calibration tokens (with --calibrate)")
-    parser.add_argument("--expert_buffer", type=int, default=32,
-                        help="Experts loaded at once (MiniMax only, with --calibrate). "
-                             "Peak RAM ≈ expert_buffer × 54 MB.")
-    parser.add_argument("--keep_fp8_layers", type=int, default=0,
-                        help="Keep N most sensitive layers at original precision "
-                             "(FP8/BF16) instead of MXFP4. Requires --calibrate. "
-                             "Adds modules_to_not_convert to quantization_config.")
     parser.add_argument("--format", choices=["fused", "ct"], default="ct",
                         dest="output_format",
                         help="Output format: 'ct' (compressed-tensors per-expert, stock vLLM) or "
@@ -97,62 +77,6 @@ def main():
     model_dir = Path(args.model_dir)
     output_dir = Path(args.output_dir)
 
-    # ---------------------------------------------------------------
-    # AWQ calibration mode: fused calibration + quantization
-    # ---------------------------------------------------------------
-    if args.calibrate:
-        if not args.corpus:
-            parser.error("--calibrate requires --corpus")
-        if not args.model_family:
-            parser.error("--calibrate requires --model_family")
-
-        try:
-            from transformers import AutoTokenizer
-        except ImportError:
-            raise ImportError("transformers required for --calibrate: pip install transformers")
-
-        from quant4.awq import run_awq_pipeline
-        from quant4.calibrate import MiniMaxLayerRunner, Qwen3LayerRunner
-
-        tokenizer = AutoTokenizer.from_pretrained(str(model_dir))
-        with open(args.corpus) as f:
-            text = f.read(args.n_tokens * 6)  # rough char estimate
-        token_ids = tokenizer(
-            text, return_tensors="pt", truncation=True, max_length=args.n_tokens
-        ).input_ids
-
-        RUNNERS = {"qwen3": Qwen3LayerRunner, "minimax": MiniMaxLayerRunner}
-        runner_cls = RUNNERS[args.model_family]
-        runner_kwargs = {"device": args.device}
-        if args.model_family == "minimax":
-            runner_kwargs["expert_buffer"] = args.expert_buffer
-        processor = runner_cls(model_dir, **runner_kwargs)
-
-        with open(model_dir / "config.json") as f:
-            _cfg = json.load(f)
-        _cfg = _cfg.get("text_config", _cfg)
-        n_layers = _cfg.get("num_hidden_layers")
-
-        print(f"AWQ calibration mode")
-        print(f"  Tokens:          {token_ids.shape[1]}")
-        print(f"  Layers:          {n_layers}")
-        print(f"  Model family:    {args.model_family}")
-        print(f"  Device:          {args.device}")
-        print(f"  Scale percentile:{args.scale_percentile}")
-        print(f"  Exclude:         {args.exclude_layers}")
-        if args.keep_fp8_layers:
-            print(f"  Keep FP8 layers: {args.keep_fp8_layers} most sensitive")
-
-        run_awq_pipeline(
-            processor, token_ids, n_layers, model_dir, output_dir,
-            args.exclude_layers, args.scale_percentile,
-            keep_fp8_layers=args.keep_fp8_layers,
-        )
-        return
-
-    # ---------------------------------------------------------------
-    # Shard-parallel mode (existing path)
-    # ---------------------------------------------------------------
     output_dir.mkdir(parents=True, exist_ok=True)
 
     index_path = model_dir / "model.safetensors.index.json"
@@ -184,9 +108,8 @@ def main():
         if args.calibration_stats:
             # Validate the file and print summary, but don't load tensors here —
             # workers load it themselves to avoid cross-process fd sharing.
-            import json as _json
             with open(args.calibration_stats) as f:
-                _raw = _json.load(f)
+                _raw = json.load(f)
             layer_keys = sorted(int(k) for k in _raw)
             print(f"Calibration stats: {len(layer_keys)} layers "
                   f"(layers {layer_keys[0]}-{layer_keys[-1]}), "
@@ -220,7 +143,6 @@ def main():
     elif model_dir.resolve() == output_dir.resolve():
         print("Zero-copy:        disabled (input == output directory)")
 
-    # Classify shards and build dispatch plan
     final_weight_map = {}
     shards_to_process = []  # (shard_name, output_path, quantize_only_keys or None)
     n_linked = 0
@@ -272,12 +194,10 @@ def main():
         print(f"Shard plan:       {n_linked} linked, {n_mixed} mixed, {n_full} full-process "
               f"({len(shards_to_process)} to quantize)")
 
-    total_in_size = sum(os.path.getsize(model_dir / s) for s in existing)
     process_size = sum(os.path.getsize(model_dir / s) for s, _, _, _ in shards_to_process)
 
     # Use 'spawn' when CUDA is requested to avoid fork-induced deadlocks.
     # Forked processes inherit the parent's CUDA context, causing contention.
-    import multiprocessing as mp
     mp_ctx = mp.get_context("spawn") if args.device != "cpu" else None
     with ProcessPoolExecutor(max_workers=args.workers, mp_context=mp_ctx) as pool:
         futures = {}
@@ -299,7 +219,6 @@ def main():
             )
             futures[fut] = (src_name, out_shard_name)
 
-        import time
         t0 = time.monotonic()
         done = 0
         bytes_done = 0
@@ -307,7 +226,6 @@ def main():
             src_name, out_shard_name = futures[fut]
             try:
                 result_map = fut.result()
-                # Update index: result_map has {tensor_name: output_shard_basename}
                 final_weight_map.update(result_map)
                 done += 1
                 bytes_done += os.path.getsize(model_dir / src_name)
@@ -324,7 +242,6 @@ def main():
     if not final_weight_map:
         raise RuntimeError("No tensors found in output — something went wrong")
 
-    # Copy tokenizer, configs, etc.
     for src in model_dir.iterdir():
         if src.is_file() and not src.name.endswith(".safetensors"):
             shutil.copy2(src, output_dir / src.name)
@@ -369,7 +286,6 @@ def main():
         json.dump(config, f, indent=2)
 
     total_in = sum(os.path.getsize(model_dir / s) for s in existing)
-    # Count actual new data written (exclude symlinked shards)
     new_data = 0
     total_out = 0
     for sf in output_dir.glob("*.safetensors"):

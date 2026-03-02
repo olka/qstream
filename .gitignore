@@ -6,3 +6,6 @@ dist/
 build/
 .venv/
 minimax_stats.json
+
+# slopometry session cache (auto-generated)
+.slopometry/

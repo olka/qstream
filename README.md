@@ -145,7 +145,8 @@ For BF16 input models, quant4 symlinks unchanged shards (embedding, attention) a
 | `--calibration_stats` | none | Path to `stats.json` from `calibrate.py`; overrides γ proxy |
 | `--device` | cpu | Device for quantization kernel (`cpu` or `cuda`) |
 | `--fp8_block_size` | 128 | FP8 dequantization block size |
-| `--no_zero_copy` | off | Force full read/write (no symlinks) |
+| `--use_zero_copy` | off | Enable symlink passthrough for unchanged shards |
+| `--format` | ct | Output format: `ct` (compressed-tensors, stock vLLM) or `fused` (w13/w2, vLLM fork) |
 
 Default exclude patterns: `*self_attn*`, `*.mlp.gate.`, `*lm_head*`, `*embed_tokens*`
 

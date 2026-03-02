@@ -7,7 +7,7 @@ Stats format: {layer_idx: {pre_attn, post_attn, pre_mlp, pre_down}}
 Each value is mean(|x|, dim=tokens) over the calibration corpus.
 
 Usage:
-    python scripts/calibrate.py \\
+    quant4-calibrate \\
         --model_dir /path/to/model \\
         --corpus calibration.txt \\
         --output_path calibration_stats.json \\
@@ -17,12 +17,9 @@ Usage:
 
 import argparse
 import json
-import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).parent.parent))
-
-from quant4.calibrate import MiniMaxLayerRunner, Qwen3LayerRunner, collect_activation_stats
+from quant4.calibrate import MiniMaxLayerRunner, ModelConfig, Qwen3LayerRunner, collect_activation_stats
 
 RUNNERS = {
     "qwen3": Qwen3LayerRunner,
@@ -67,11 +64,9 @@ def main():
     runner = runner_cls(model_dir, **runner_kwargs)
 
     with open(model_dir / "config.json") as f:
-        config = json.load(f)
-    config = config.get("text_config", config)
-    n_layers = config.get("num_hidden_layers") or config.get("n_layers")
+        model_cfg = ModelConfig.from_json(json.load(f))
 
-    stats = collect_activation_stats(runner, token_ids, n_layers=n_layers)
+    stats = collect_activation_stats(runner, token_ids, n_layers=model_cfg.n_layers)
 
     # Serialize: {str(layer_idx): {act_type: [float, ...]}}
     serializable = {

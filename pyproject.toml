@@ -17,7 +17,9 @@ calibrate = ["transformers>=4.40"]
 
 [project.scripts]
 quant4-quantize = "scripts.quantize:main"
+quant4-calibrate = "scripts.calibrate:main"
+quant4-analyze = "scripts.analyze_quant_error:main"
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["quant4*"]
+include = ["quant4*", "scripts*"]

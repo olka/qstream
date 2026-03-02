@@ -7,7 +7,7 @@ Activation-aware: optional γ-weighted MSE (γ = input_layernorm.weight).
 
 import torch
 
-BLOCK_SIZE = 32  # elements per MXFP4 scale
+BLOCK_SIZE = 32
 
 # MXFP4 E2M1 representable positive values: 0, 0.5, 1, 1.5, 2, 3, 4, 6
 # Boundaries are midpoints between consecutive values.
@@ -194,7 +194,6 @@ def quantize_mxfp4(
         needs_correction = has_overflow & (raw_exp < safe_exp - 1)
         raw_exp = torch.where(needs_correction, safe_exp, raw_exp)
 
-    # --- Final quantization with selected exponents ---
     biased_exp = (raw_exp + 127).clamp(0, 254).to(torch.uint8)
     actual_scale = torch.pow(2.0, raw_exp)
 
