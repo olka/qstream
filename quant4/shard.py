@@ -122,6 +122,7 @@ def process_shard(
     calibration_stats_path: str | None = None,
     device: str = "cpu",
     quantize_only_keys: list[str] | None = None,
+    output_format: str = "ct",
 ) -> dict[str, str]:
     """Quantize all eligible weights in one safetensors shard to MXFP4.
 
@@ -228,15 +229,47 @@ def process_shard(
                 else:
                     packed, scales = quantize_mxfp4(weight_bf16, scale_percentile, gamma=g_dev)
 
-                # Interleave gate_up_proj to gpt-oss format [g0,u0,g1,u1,...]
-                if isinstance(handler, FusedExpertHandler) and "gate_up_proj" in k:
-                    packed = FusedExpertHandler.interleave_gate_up(packed)
-                    scales = FusedExpertHandler.interleave_gate_up(scales)
+                if isinstance(handler, FusedExpertHandler) and output_format == "ct":
+                    # CT format: output per-expert separate tensors
+                    # Base: "model.layers.X.mlp.experts.gate_up_proj" or ".down_proj"
+                    base = re.sub(r"\.(gate_up_proj|down_proj|gate_proj|up_proj)$", "", k)
+                    n_experts = packed.shape[0]
 
-                packed_key, scale_key = handler.output_keys(k)
-                output_tensors[packed_key] = packed.cpu()
-                output_tensors[scale_key] = scales.cpu()
-                n_quantized += 1
+                    if "gate_up_proj" in k:
+                        # packed shape: [E, 2*N, K//2], scales: [E, 2*N, K//32]
+                        N = packed.shape[1] // 2
+                        for i in range(n_experts):
+                            gate_p = packed[i, :N, :].cpu()
+                            gate_s = scales[i, :N, :].cpu()
+                            up_p = packed[i, N:, :].cpu()
+                            up_s = scales[i, N:, :].cpu()
+                            output_tensors[f"{base}.{i}.gate_proj.weight_packed"] = gate_p
+                            output_tensors[f"{base}.{i}.gate_proj.weight_scale"] = gate_s
+                            output_tensors[f"{base}.{i}.up_proj.weight_packed"] = up_p
+                            output_tensors[f"{base}.{i}.up_proj.weight_scale"] = up_s
+                    elif "down_proj" in k:
+                        for i in range(n_experts):
+                            output_tensors[f"{base}.{i}.down_proj.weight_packed"] = packed[i].cpu()
+                            output_tensors[f"{base}.{i}.down_proj.weight_scale"] = scales[i].cpu()
+                    elif "gate_proj" in k:
+                        for i in range(n_experts):
+                            output_tensors[f"{base}.{i}.gate_proj.weight_packed"] = packed[i].cpu()
+                            output_tensors[f"{base}.{i}.gate_proj.weight_scale"] = scales[i].cpu()
+                    elif "up_proj" in k:
+                        for i in range(n_experts):
+                            output_tensors[f"{base}.{i}.up_proj.weight_packed"] = packed[i].cpu()
+                            output_tensors[f"{base}.{i}.up_proj.weight_scale"] = scales[i].cpu()
+                    n_quantized += 1
+                else:
+                    # Fused format: interleave gate_up and output as w13/w2
+                    if isinstance(handler, FusedExpertHandler) and "gate_up_proj" in k:
+                        packed = FusedExpertHandler.interleave_gate_up(packed)
+                        scales = FusedExpertHandler.interleave_gate_up(scales)
+
+                    packed_key, scale_key = handler.output_keys(k)
+                    output_tensors[packed_key] = packed.cpu()
+                    output_tensors[scale_key] = scales.cpu()
+                    n_quantized += 1
 
             else:
                 # Pass through, dequanting FP8 where needed

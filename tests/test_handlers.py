@@ -103,12 +103,19 @@ class TestFusedExpertHandler:
             "model.layers.0.some_random_tensor", t, []
         ) is False
 
-    def test_output_keys(self):
+    def test_output_keys_gate_up(self):
         packed_key, scale_key = self.handler.output_keys(
             "model.layers.0.mlp.experts.gate_up_proj"
         )
-        assert packed_key == "model.layers.0.mlp.experts.gate_up_proj"
-        assert scale_key == "model.layers.0.mlp.experts.gate_up_proj_scale"
+        assert packed_key == "model.layers.0.mlp.experts.w13_weight"
+        assert scale_key == "model.layers.0.mlp.experts.w13_weight_scale"
+
+    def test_output_keys_down(self):
+        packed_key, scale_key = self.handler.output_keys(
+            "model.layers.0.mlp.experts.down_proj"
+        )
+        assert packed_key == "model.layers.0.mlp.experts.w2_weight"
+        assert scale_key == "model.layers.0.mlp.experts.w2_weight_scale"
 
 
 class TestGetHandler:

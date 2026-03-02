@@ -169,8 +169,8 @@ class TestProcessShard:
                 exclude_patterns=[], input_format="fp16",
             )
 
-            assert "model.layers.0.mlp.experts.gate_up_proj" in result
-            assert "model.layers.0.mlp.experts.gate_up_proj_scale" in result
+            assert "model.layers.0.mlp.experts.w13_weight" in result
+            assert "model.layers.0.mlp.experts.w13_weight_scale" in result
 
     def test_passthrough_excluded(self):
         with tempfile.TemporaryDirectory() as tmpdir:

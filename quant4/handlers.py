@@ -119,8 +119,15 @@ class FusedExpertHandler:
         return torch.stack([gate, up], dim=2).reshape(tensor.shape)
 
     def output_keys(self, key: str) -> tuple[str, str]:
-        """Return (packed_key, scale_key) — append suffix to bare key."""
-        return (key, key + "_scale")
+        """Return (packed_key, scale_key) using vLLM mxfp4 parameter names."""
+        if "gate_up_proj" in key:
+            base = key.replace("gate_up_proj", "w13_weight")
+            return (base, base + "_scale")
+        elif "down_proj" in key:
+            base = key.replace("down_proj", "w2_weight")
+            return (base, base + "_scale")
+        else:
+            return (key, key + "_scale")
 
 
 # Handler registry — checked in order, first match wins.

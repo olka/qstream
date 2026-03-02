@@ -64,9 +64,10 @@ def main():
     parser.add_argument("--calibration_stats", default=None,
                         help="Path to calibration_stats.json from scripts/calibrate.py. "
                              "When provided, overrides input_layernorm.weight γ proxy.")
-    parser.add_argument("--no_zero_copy", action="store_true",
-                        help="Disable zero-copy passthrough: read/write all tensors "
-                             "(original behavior, slower but no symlinks)")
+    parser.add_argument("--use_zero_copy", action="store_true",
+                        help="Enable zero-copy passthrough: symlink shards with only "
+                             "passthrough tensors (faster but leaves stale BF16 expert "
+                             "tensors in symlinked shards, incompatible with some loaders)")
     # AWQ calibration mode
     parser.add_argument("--calibrate", action="store_true",
                         help="AWQ-style Hessian calibration: run forward pass and "
@@ -84,6 +85,10 @@ def main():
                         help="Keep N most sensitive layers at original precision "
                              "(FP8/BF16) instead of MXFP4. Requires --calibrate. "
                              "Adds modules_to_not_convert to quantization_config.")
+    parser.add_argument("--format", choices=["fused", "ct"], default="ct",
+                        dest="output_format",
+                        help="Output format: 'ct' (compressed-tensors per-expert, stock vLLM) or "
+                             "'fused' (w13/w2, needs vLLM fork)")
     args = parser.parse_args()
 
     if args.threads_per_worker == 0:
@@ -166,6 +171,7 @@ def main():
 
     input_format = detect_input_format(str(model_dir / existing[0]))
     print(f"Input format:     {input_format.upper()}")
+    print(f"Output format:    {args.output_format}")
     print(f"Shards:           {len(existing)}")
     print(f"Workers:          {args.workers} × {args.threads_per_worker} threads")
     print(f"Scale percentile: {args.scale_percentile}")
@@ -200,7 +206,7 @@ def main():
     # Zero-copy passthrough: for BF16 models, symlink shards with unchanged
     # tensors instead of reading and rewriting them.
     input_has_symlinks = any((model_dir / s).is_symlink() for s in existing)
-    use_zero_copy = (input_format == "fp16" and not args.no_zero_copy
+    use_zero_copy = (input_format == "fp16" and args.use_zero_copy
                      and model_dir.resolve() != output_dir.resolve()
                      and not input_has_symlinks)
     if use_zero_copy:
@@ -209,8 +215,8 @@ def main():
         print("Zero-copy:        disabled (input contains symlinks — likely a previous zero-copy output)")
     elif input_format == "fp8":
         print("Zero-copy:        disabled (FP8 models need dequant)")
-    elif args.no_zero_copy:
-        print("Zero-copy:        disabled (--no_zero_copy)")
+    elif not args.use_zero_copy:
+        print("Zero-copy:        disabled (default)")
     elif model_dir.resolve() == output_dir.resolve():
         print("Zero-copy:        disabled (input == output directory)")
 
@@ -269,7 +275,11 @@ def main():
     total_in_size = sum(os.path.getsize(model_dir / s) for s in existing)
     process_size = sum(os.path.getsize(model_dir / s) for s, _, _, _ in shards_to_process)
 
-    with ProcessPoolExecutor(max_workers=args.workers) as pool:
+    # Use 'spawn' when CUDA is requested to avoid fork-induced deadlocks.
+    # Forked processes inherit the parent's CUDA context, causing contention.
+    import multiprocessing as mp
+    mp_ctx = mp.get_context("spawn") if args.device != "cpu" else None
+    with ProcessPoolExecutor(max_workers=args.workers, mp_context=mp_ctx) as pool:
         futures = {}
         for src_name, out_path, q_keys, out_shard_name in shards_to_process:
             fut = pool.submit(
@@ -285,6 +295,7 @@ def main():
                 calibration_stats_path,
                 args.device,
                 q_keys,
+                args.output_format,
             )
             futures[fut] = (src_name, out_shard_name)
 
@@ -333,23 +344,27 @@ def main():
         for k in final_weight_map
         if k.endswith(".weight")
     )
-    config["quantization_config"] = {
-        "quant_method": "compressed-tensors",
-        "format": "mxfp4-pack-quantized",
-        "config_groups": {
-            "group_0": {
-                "targets": ["Linear"],
-                "weights": {
-                    "num_bits": 4,
-                    "type": "float",
-                    "strategy": "group",
-                    "group_size": 32,
-                    "symmetric": True,
-                },
-            }
-        },
-        "ignore": ignore_modules,
-    }
+    is_moe = any("w13_weight" in k for k in final_weight_map)
+    if is_moe and args.output_format == "fused":
+        config["quantization_config"] = {"quant_method": "mxfp4"}
+    else:
+        config["quantization_config"] = {
+            "quant_method": "compressed-tensors",
+            "format": "mxfp4-pack-quantized",
+            "config_groups": {
+                "group_0": {
+                    "targets": ["Linear"],
+                    "weights": {
+                        "num_bits": 4,
+                        "type": "float",
+                        "strategy": "group",
+                        "group_size": 32,
+                        "symmetric": True,
+                    },
+                }
+            },
+            "ignore": ignore_modules,
+        }
     with open(config_path, "w") as f:
         json.dump(config, f, indent=2)
 
