@@ -1179,3 +1179,157 @@ class Qwen3LayerRunner:
             torch.cuda.empty_cache()
 
         return hidden, quantized, layer_error[0]
+
+
+class MolmoActLayerRunner:
+    """Streaming layer runner for MolmoAct (Qwen2.5-7B backbone, dense).
+
+    Architecture:
+        model.transformer.wte.embedding + wte.new_embedding  → embedding
+        model.transformer.blocks.N.attn_norm                 → RMSNorm
+        model.transformer.blocks.N.self_attn.att_proj         → fused QKV [4608, 3584]
+        model.transformer.blocks.N.self_attn.attn_out         → o_proj [3584, 3584]
+        model.transformer.blocks.N.ff_norm                    → RMSNorm
+        model.transformer.blocks.N.mlp.ff_proj                → fused gate+up [37888, 3584]
+        model.transformer.blocks.N.mlp.ff_out                 → down_proj [3584, 18944]
+        model.transformer.ln_f                                → final RMSNorm
+
+    Config from llm_config:
+        hidden_size=3584, n_heads=28, n_kv_heads=4, head_dim=128,
+        intermediate_size=18944, rope_theta=1e6, layer_norm_eps=1e-6,
+        qkv_bias=True, hidden_act=silu, 28 layers.
+    """
+
+    def __init__(self, model_dir: str | Path, device: str = "cpu"):
+        self.model_dir = Path(model_dir)
+        self.device = torch.device(device)
+
+        with open(self.model_dir / "config.json") as f:
+            raw = json.load(f)
+
+        llm = raw.get("llm_config", raw)
+        self.hidden_size = llm["hidden_size"]
+        self.n_heads = llm["num_attention_heads"]
+        self.n_kv_heads = llm.get("num_key_value_heads", self.n_heads)
+        self.head_dim = llm.get("head_dim", self.hidden_size // self.n_heads)
+        self.intermediate_size = llm["intermediate_size"]
+        self.n_layers = llm["num_hidden_layers"]
+        self.rope_theta = float(llm.get("rope_theta", 1e6))
+        self.rms_norm_eps = float(llm.get("layer_norm_eps", 1e-6))
+        self.qkv_bias = llm.get("qkv_bias", True)
+
+        index_path = self.model_dir / "model.safetensors.index.json"
+        with open(index_path) as f:
+            self._weight_map: dict[str, str] = json.load(f)["weight_map"]
+
+    def _load_tensors(self, keys: list[str]) -> dict[str, torch.Tensor]:
+        shard_to_keys: dict[str, list[str]] = {}
+        for k in keys:
+            shard = self._weight_map.get(k)
+            if shard:
+                shard_to_keys.setdefault(shard, []).append(k)
+        result: dict[str, torch.Tensor] = {}
+        for shard, shard_keys in shard_to_keys.items():
+            with safe_open(str(self.model_dir / shard), framework="pt") as f:
+                for k in shard_keys:
+                    result[k] = f.get_tensor(k)
+        return result
+
+    def _load_layer(self, layer_idx: int) -> dict[str, torch.Tensor]:
+        prefix = f"model.transformer.blocks.{layer_idx}."
+        layer_keys = [k for k in self._weight_map if k.startswith(prefix)]
+        raw = self._load_tensors(layer_keys)
+        result: dict[str, torch.Tensor] = {}
+        for k in layer_keys:
+            short_key = k[len(prefix):]
+            result[short_key] = raw[k].float().to(self.device)
+        return result
+
+    def embed(self, token_ids: torch.Tensor) -> torch.Tensor:
+        """token_ids [B, T] → hidden [B, T, hidden_size] float32."""
+        keys = [k for k in self._weight_map if "wte." in k]
+        raw = self._load_tensors(keys)
+
+        embed_w = raw["model.transformer.wte.embedding"].float()
+        if "model.transformer.wte.new_embedding" in raw:
+            new_embed = raw["model.transformer.wte.new_embedding"].float()
+            embed_w = torch.cat([embed_w, new_embed], dim=0)
+
+        hidden = F.embedding(token_ids.cpu(), embed_w.cpu())
+        return hidden.to(self.device)
+
+    def run_layer(
+        self,
+        hidden: torch.Tensor,
+        layer_idx: int,
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        """Run one transformer layer.
+
+        Stats keys:
+            pre_attn:  mean(|x|) before att_proj  — shape [hidden_size]
+            post_attn: mean(|x|) before attn_out  — shape [n_heads * head_dim]
+            pre_mlp:   mean(|x|) before ff_proj   — shape [hidden_size]
+            pre_down:  mean(|x|) before ff_out    — shape [intermediate_size]
+        """
+        w = self._load_layer(layer_idx)
+        B, T, H = hidden.shape
+
+        # 1. Pre-attention RMSNorm
+        x_attn = _rms_norm(hidden, w["attn_norm.weight"], self.rms_norm_eps)
+        stat_pre_attn = x_attn.reshape(-1, H).abs().mean(0).cpu()
+
+        # 2. Fused QKV projection
+        qkv = F.linear(x_attn, w["self_attn.att_proj.weight"],
+                        w.get("self_attn.att_proj.bias"))
+        q_dim = self.n_heads * self.head_dim
+        kv_dim = self.n_kv_heads * self.head_dim
+        q, k, v = qkv.split([q_dim, kv_dim, kv_dim], dim=-1)
+
+        q = q.reshape(B, T, self.n_heads, self.head_dim).transpose(1, 2)
+        k = k.reshape(B, T, self.n_kv_heads, self.head_dim).transpose(1, 2)
+        v = v.reshape(B, T, self.n_kv_heads, self.head_dim).transpose(1, 2)
+
+        # 3. RoPE
+        cos, sin = _build_rope(T, self.head_dim, self.rope_theta, self.device)
+        q, k = _apply_rotary(q, k, cos, sin)
+
+        # 4. GQA expand
+        if self.n_kv_heads != self.n_heads:
+            repeat = self.n_heads // self.n_kv_heads
+            k = k.repeat_interleave(repeat, dim=1)
+            v = v.repeat_interleave(repeat, dim=1)
+
+        # 5. Attention
+        attn_out = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+
+        # 6. Post-attention reshape + stat
+        post_attn = attn_out.transpose(1, 2).reshape(B, T, q_dim)
+        stat_post_attn = post_attn.reshape(-1, q_dim).abs().mean(0).cpu()
+
+        # 7. o_proj + residual
+        hidden = hidden + F.linear(post_attn, w["self_attn.attn_out.weight"])
+
+        # 8. Pre-MLP RMSNorm
+        x_mlp = _rms_norm(hidden, w["ff_norm.weight"], self.rms_norm_eps)
+        stat_pre_mlp = x_mlp.reshape(-1, H).abs().mean(0).cpu()
+
+        # 9. Fused gate+up → SiLU
+        gate_up = F.linear(x_mlp, w["mlp.ff_proj.weight"])
+        gate, up = gate_up.chunk(2, dim=-1)
+        pre_down = F.silu(gate) * up
+        stat_pre_down = pre_down.reshape(-1, self.intermediate_size).abs().mean(0).cpu()
+
+        # 10. Down projection + residual
+        hidden = hidden + F.linear(pre_down, w["mlp.ff_out.weight"])
+
+        del w
+        gc.collect()
+        if self.device.type == "cuda":
+            torch.cuda.empty_cache()
+
+        return hidden, {
+            "pre_attn": stat_pre_attn,
+            "post_attn": stat_post_attn,
+            "pre_mlp": stat_pre_mlp,
+            "pre_down": stat_pre_down,
+        }

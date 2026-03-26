@@ -10,6 +10,7 @@ a new handler and registering it in get_handler().
 """
 
 import re
+from fnmatch import fnmatch
 
 import torch
 
@@ -21,12 +22,38 @@ _FUSED_EXPERT_PATTERNS = re.compile(
 )
 
 
+def _match(key: str, pattern: str) -> bool:
+    """Match key against pattern: fnmatch glob if '*' present, else substring."""
+    if "*" in pattern:
+        return fnmatch(key, pattern)
+    return pattern in key
+
+
 def _passes_exclude_filter(key: str, exclude_patterns: list[str]) -> bool:
     """Return True if key is NOT excluded (should be kept/quantized)."""
     for pattern in exclude_patterns:
-        if pattern.strip("*") in key:
+        if _match(key, pattern):
             return False  # excluded
     return True  # not excluded
+
+
+def _passes_include_filter(key: str, include_patterns: list[str]) -> bool:
+    """Return True if key matches any include pattern (should be quantized)."""
+    for pattern in include_patterns:
+        if _match(key, pattern):
+            return True
+    return False
+
+
+def should_quantize_key(
+    key: str,
+    exclude_patterns: list[str],
+    include_patterns: list[str] | None = None,
+) -> bool:
+    """Unified filter: include_patterns overrides exclude_patterns when set."""
+    if include_patterns is not None:
+        return _passes_include_filter(key, include_patterns)
+    return _passes_exclude_filter(key, exclude_patterns)
 
 
 class StandardWeightHandler:
@@ -37,13 +64,14 @@ class StandardWeightHandler:
     """
 
     def should_quantize(
-        self, key: str, tensor: torch.Tensor, exclude_patterns: list[str]
+        self, key: str, tensor: torch.Tensor, exclude_patterns: list[str],
+        include_patterns: list[str] | None = None,
     ) -> bool:
         if not key.endswith(".weight"):
             return False
         if tensor.ndim != 2:
             return False
-        return _passes_exclude_filter(key, exclude_patterns)
+        return should_quantize_key(key, exclude_patterns, include_patterns)
 
     def prepare_weight(
         self,
@@ -67,8 +95,10 @@ class StandardWeightHandler:
             )
         return tensor.to(device, torch.bfloat16)
 
-    def output_keys(self, key: str) -> tuple[str, str]:
-        """Return (packed_key, scale_key) for the quantized output."""
+    def output_keys(self, key: str, quant_format: str = "mxfp4") -> tuple[str, str]:
+        """Return (weight_key, scale_key) for the quantized output."""
+        if quant_format == "fp8":
+            return (key, key.replace(".weight", ".weight_scale"))
         return (
             key.replace(".weight", ".weight_packed"),
             key.replace(".weight", ".weight_scale"),
@@ -87,13 +117,14 @@ class FusedExpertHandler:
     """
 
     def should_quantize(
-        self, key: str, tensor: torch.Tensor, exclude_patterns: list[str]
+        self, key: str, tensor: torch.Tensor, exclude_patterns: list[str],
+        include_patterns: list[str] | None = None,
     ) -> bool:
         if tensor.ndim != 3:
             return False
         if not _FUSED_EXPERT_PATTERNS.search(key):
             return False
-        return _passes_exclude_filter(key, exclude_patterns)
+        return should_quantize_key(key, exclude_patterns, include_patterns)
 
     def prepare_weight(
         self,
@@ -118,8 +149,10 @@ class FusedExpertHandler:
         gate, up = tensor.chunk(2, dim=1)
         return torch.stack([gate, up], dim=2).reshape(tensor.shape)
 
-    def output_keys(self, key: str) -> tuple[str, str]:
-        """Return (packed_key, scale_key) using vLLM mxfp4 parameter names."""
+    def output_keys(self, key: str, quant_format: str = "mxfp4") -> tuple[str, str]:
+        """Return (weight_key, scale_key) using vLLM parameter names."""
+        if quant_format == "fp8":
+            return (key, key + "_scale")
         if "gate_up_proj" in key:
             base = key.replace("gate_up_proj", "w13_weight")
             return (base, base + "_scale")

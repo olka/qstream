@@ -17,6 +17,7 @@ Flags:
     --no_activation_aware   Disable γ-weighted MSE (unweighted MSE only).
     --scale_percentile N    Anchor percentile for MSE candidate generation (default 99.5).
     --exclude_layers ...    Substring patterns for tensors to skip.
+    --include_layers ...    Substring patterns for tensors to quantize (overrides --exclude_layers).
 """
 
 import argparse
@@ -24,9 +25,10 @@ import json
 import multiprocessing as mp
 import os
 import resource
+import signal
 import shutil
 import time
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor, wait, FIRST_COMPLETED
 from pathlib import Path
 
 # Raise the open-file-descriptor limit to the hard cap.
@@ -39,14 +41,25 @@ from qstream.shard import classify_shard, detect_input_format, process_shard
 
 
 def main():
-    parser = argparse.ArgumentParser(description="MXFP4 quantization (qstream)")
+    parser = argparse.ArgumentParser(description="Quantization (qstream)")
     parser.add_argument("--model_dir", required=True)
     parser.add_argument("--output_dir", required=True)
+    parser.add_argument(
+        "--quant_format", choices=["mxfp4", "fp8"], default="mxfp4",
+        help="Quantization format: mxfp4 (4-bit, default) or fp8 (8-bit per-channel)",
+    )
     parser.add_argument(
         "--exclude_layers",
         nargs="*",
         default=["*self_attn*", "*.mlp.gate.", "*lm_head*", "*embed_tokens*"],
         help="Substring patterns for tensors to exclude from quantization",
+    )
+    parser.add_argument(
+        "--include_layers",
+        nargs="*",
+        default=None,
+        help="Substring patterns for tensors to include (overrides --exclude_layers). "
+             "Only matching tensors are quantized; everything else is passed through.",
     )
     parser.add_argument("--fp8_block_size", type=int, default=128)
     parser.add_argument("--workers", type=int, default=4)
@@ -95,12 +108,21 @@ def main():
 
     input_format = detect_input_format(str(model_dir / existing[0]))
     print(f"Input format:     {input_format.upper()}")
+    print(f"Quant format:     {args.quant_format.upper()}")
     print(f"Output format:    {args.output_format}")
     print(f"Shards:           {len(existing)}")
     print(f"Workers:          {args.workers} × {args.threads_per_worker} threads")
-    print(f"Scale percentile: {args.scale_percentile}")
-    print(f"Exclude patterns: {args.exclude_layers}")
-    print(f"MSE scale select: enabled (3 candidates per block)")
+    if args.quant_format == "mxfp4":
+        print(f"Scale percentile: {args.scale_percentile}")
+    if args.include_layers:
+        print(f"Include patterns: {args.include_layers}")
+        print(f"  (--exclude_layers ignored)")
+    else:
+        print(f"Exclude patterns: {args.exclude_layers}")
+    if args.quant_format == "mxfp4":
+        print(f"MSE scale select: enabled (3 candidates per block)")
+    else:
+        print(f"FP8 scale:        per-channel (amax / FP8_MAX)")
 
     calibration_stats_path = None
     gamma_by_layer = None
@@ -154,7 +176,7 @@ def main():
         input_path = model_dir / s
 
         if use_zero_copy:
-            keys_q, keys_p = classify_shard(str(input_path), args.exclude_layers)
+            keys_q, keys_p = classify_shard(str(input_path), args.exclude_layers, args.include_layers)
 
             if not keys_q:
                 # ALL_PASSTHROUGH — symlink the entire shard
@@ -199,9 +221,22 @@ def main():
     # Use 'spawn' when CUDA is requested to avoid fork-induced deadlocks.
     # Forked processes inherit the parent's CUDA context, causing contention.
     mp_ctx = mp.get_context("spawn") if args.device != "cpu" else None
-    with ProcessPoolExecutor(max_workers=args.workers, mp_context=mp_ctx) as pool:
+
+    # Per-shard timeout: if no shard completes within this window, assume deadlock.
+    shard_timeout = 300
+
+    remaining = list(shards_to_process)
+    t0 = time.monotonic()
+    done = 0
+    bytes_done = 0
+
+    while remaining:
+        batch = list(remaining)
+        remaining = []
+
+        pool = ProcessPoolExecutor(max_workers=args.workers, mp_context=mp_ctx)
         futures = {}
-        for src_name, out_path, q_keys, out_shard_name in shards_to_process:
+        for src_name, out_path, q_keys, out_shard_name in batch:
             fut = pool.submit(
                 process_shard,
                 str(model_dir / src_name),
@@ -216,28 +251,57 @@ def main():
                 args.device,
                 q_keys,
                 args.output_format,
+                args.include_layers,
+                args.quant_format,
             )
             futures[fut] = (src_name, out_shard_name)
 
-        t0 = time.monotonic()
-        done = 0
-        bytes_done = 0
-        for fut in as_completed(futures):
-            src_name, out_shard_name = futures[fut]
-            try:
-                result_map = fut.result()
-                final_weight_map.update(result_map)
-                done += 1
-                bytes_done += os.path.getsize(model_dir / src_name)
-                elapsed = time.monotonic() - t0
-                pct = bytes_done / process_size * 100 if process_size else 100
-                eta = elapsed / bytes_done * (process_size - bytes_done) if bytes_done else 0
-                eta_m, eta_s = divmod(int(eta), 60)
-                print(f"[{done}/{len(shards_to_process)}] {src_name} done  "
-                      f"({pct:.0f}% | elapsed {int(elapsed)}s | ETA {eta_m}m{eta_s:02d}s)")
-            except Exception as e:
-                print(f"ERROR in {src_name}: {e}")
-                raise
+        pending = set(futures.keys())
+        last_completion = time.monotonic()
+        timed_out = False
+
+        while pending:
+            done_set, pending = wait(pending, timeout=30,
+                                     return_when=FIRST_COMPLETED)
+
+            if done_set:
+                last_completion = time.monotonic()
+                for fut in done_set:
+                    src_name, out_shard_name = futures[fut]
+                    try:
+                        result_map = fut.result()
+                        final_weight_map.update(result_map)
+                        done += 1
+                        bytes_done += os.path.getsize(model_dir / src_name)
+                        elapsed = time.monotonic() - t0
+                        pct = bytes_done / process_size * 100 if process_size else 100
+                        eta = elapsed / bytes_done * (process_size - bytes_done) if bytes_done else 0
+                        eta_m, eta_s = divmod(int(eta), 60)
+                        print(f"[{done}/{len(shards_to_process)}] {src_name} done  "
+                              f"({pct:.0f}% | elapsed {int(elapsed)}s | ETA {eta_m}m{eta_s:02d}s)")
+                    except Exception as e:
+                        print(f"ERROR in {src_name}: {e}")
+                        raise
+
+            elif time.monotonic() - last_completion > shard_timeout:
+                # No shard completed within timeout — assume deadlock.
+                stuck = [futures[f][0] for f in pending]
+                print(f"\nTIMEOUT: no shard completed in {shard_timeout}s — "
+                      f"{len(stuck)} stuck: {stuck}")
+                for fut in pending:
+                    remaining.append(next(
+                        s for s in batch if s[0] == futures[fut][0]
+                    ))
+                    print(f"  Will retry: {futures[fut][0]}")
+                timed_out = True
+                break
+
+        # Kill worker processes and shut down pool without blocking.
+        if timed_out:
+            for pid, proc in pool._processes.items():
+                if proc.is_alive():
+                    os.kill(pid, signal.SIGKILL)
+        pool.shutdown(wait=not timed_out, cancel_futures=timed_out)
 
     if not final_weight_map:
         raise RuntimeError("No tensors found in output — something went wrong")
@@ -255,14 +319,42 @@ def main():
     config_path = output_dir / "config.json"
     with open(config_path) as f:
         config = json.load(f)
-    # Modules with plain .weight in the output were not quantized.
-    ignore_modules = sorted(
-        k[: -len(".weight")]
-        for k in final_weight_map
-        if k.endswith(".weight")
-    )
-    is_moe = any("w13_weight" in k for k in final_weight_map)
-    if is_moe and args.output_format == "fused":
+    # For MXFP4: modules with plain .weight in the output were not quantized.
+    if args.quant_format != "fp8":
+        ignore_modules = sorted(
+            k[: -len(".weight")]
+            for k in final_weight_map
+            if k.endswith(".weight")
+        )
+    if args.quant_format == "fp8":
+        # Build ignore list: regex patterns in vLLM-space module names.
+        # re: prefixed patterns are preserved by apply_vllm_mapper and matched
+        # directly against vLLM module paths (not HF checkpoint names).
+        fp8_ignore = ["lm_head"]
+        if args.exclude_layers:
+            for pat in args.exclude_layers:
+                # Convert glob-like *name* patterns to regex for common cases
+                stripped = pat.strip("*")
+                if stripped:
+                    fp8_ignore.append(f"re:{stripped}")
+        config["quantization_config"] = {
+            "quant_method": "compressed-tensors",
+            "format": "float-quantized",
+            "config_groups": {
+                "group_0": {
+                    "targets": ["Linear"],
+                    "weights": {
+                        "num_bits": 8,
+                        "type": "float",
+                        "strategy": "channel",
+                        "symmetric": True,
+                        "dynamic": False,
+                    },
+                }
+            },
+            "ignore": fp8_ignore,
+        }
+    elif any("w13_weight" in k for k in final_weight_map) and args.output_format == "fused":
         config["quantization_config"] = {"quant_method": "mxfp4"}
     else:
         config["quantization_config"] = {

@@ -19,11 +19,18 @@ import argparse
 import json
 from pathlib import Path
 
-from qstream.calibrate import MiniMaxLayerRunner, ModelConfig, Qwen3LayerRunner, collect_activation_stats
+from qstream.calibrate import (
+    MiniMaxLayerRunner,
+    ModelConfig,
+    MolmoActLayerRunner,
+    Qwen3LayerRunner,
+    collect_activation_stats,
+)
 
 RUNNERS = {
     "qwen3": Qwen3LayerRunner,
     "minimax": MiniMaxLayerRunner,
+    "molmoact": MolmoActLayerRunner,
 }
 
 
@@ -63,10 +70,14 @@ def main():
         runner_kwargs["expert_buffer"] = args.expert_buffer
     runner = runner_cls(model_dir, **runner_kwargs)
 
-    with open(model_dir / "config.json") as f:
-        model_cfg = ModelConfig.from_json(json.load(f))
+    if args.model_family == "molmoact":
+        n_layers = runner.n_layers
+    else:
+        with open(model_dir / "config.json") as f:
+            model_cfg = ModelConfig.from_json(json.load(f))
+        n_layers = model_cfg.n_layers
 
-    stats = collect_activation_stats(runner, token_ids, n_layers=model_cfg.n_layers)
+    stats = collect_activation_stats(runner, token_ids, n_layers=n_layers)
 
     # Serialize: {str(layer_idx): {act_type: [float, ...]}}
     serializable = {

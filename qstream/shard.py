@@ -14,7 +14,7 @@ from safetensors.torch import save_file
 _libc = ctypes.CDLL("libc.so.6")
 
 from .calibrate import load_calibration_stats
-from .core import BLOCK_SIZE, quantize_mxfp4
+from .core import BLOCK_SIZE, quantize_fp8, quantize_mxfp4
 from .fp8 import dequant_fp8_block
 from .gamma import extract_layer_index
 from .handlers import (
@@ -22,15 +22,45 @@ from .handlers import (
     _FUSED_EXPERT_PATTERNS,
     _passes_exclude_filter,
     get_handler,
+    should_quantize_key,
 )
+
+
+def _smooth_norm_key(key: str) -> str | None:
+    """Return the preceding layernorm weight key for SmoothQuant, or None.
+
+    SmoothQuant can only be applied to layers with a preceding norm whose
+    weights can absorb the inverse smoothing factor.
+    """
+    # MolmoAct: att_proj ← attn_norm, ff_proj ← ff_norm
+    if ".att_proj.weight" in key:
+        return key.replace(".att_proj.weight", ".attn_norm.weight")
+    if ".ff_proj.weight" in key:
+        return key.replace(".ff_proj.weight", ".ff_norm.weight")
+    # Standard (Qwen, Llama): q/k/v_proj ← input_layernorm, gate/up_proj ← post_attention_layernorm
+    if any(f".{p}.weight" in key for p in ("q_proj", "k_proj", "v_proj", "qkv_proj")):
+        # Find the layer prefix and append input_layernorm
+        parts = key.split(".")
+        for i, p in enumerate(parts):
+            if p in ("self_attn", "attention"):
+                return ".".join(parts[:i] + ["input_layernorm", "weight"])
+        return None
+    if any(f".{p}.weight" in key for p in ("gate_proj", "up_proj", "gate_up_proj")):
+        parts = key.split(".")
+        for i, p in enumerate(parts):
+            if p == "mlp":
+                return ".".join(parts[:i] + ["post_attention_layernorm", "weight"])
+        return None
+    return None
 
 
 def activation_type_from_key(key: str) -> str | None:
     """Map a weight tensor key to its activation stat type.
 
     Returns one of: "pre_attn", "post_attn", "pre_mlp", "pre_down", or None.
-    These correspond to the keys produced by Qwen3LayerRunner.run_layer().
+    These correspond to the keys produced by LayerRunner.run_layer().
     """
+    # Standard (Qwen, Llama, etc.)
     if ".q_proj" in key or ".k_proj" in key or ".v_proj" in key:
         return "pre_attn"
     if ".o_proj" in key:
@@ -42,6 +72,15 @@ def activation_type_from_key(key: str) -> str | None:
     # Fused expert keys: gate_up_proj contains both gate and up
     if ".gate_up_proj" in key:
         return "pre_mlp"
+    # MolmoAct naming: att_proj (fused QKV), attn_out, ff_proj (fused gate+up), ff_out
+    if ".att_proj" in key:
+        return "pre_attn"
+    if ".attn_out" in key:
+        return "post_attn"
+    if ".ff_proj" in key:
+        return "pre_mlp"
+    if ".ff_out" in key:
+        return "pre_down"
     return None
 
 
@@ -75,6 +114,7 @@ def detect_input_format(shard_path: str) -> str:
 def classify_shard(
     input_path: str,
     exclude_patterns: list[str],
+    include_patterns: list[str] | None = None,
 ) -> tuple[list[str], list[str]]:
     """Classify tensors in a shard by reading only the safetensors header.
 
@@ -99,9 +139,9 @@ def classify_shard(
 
         would_quantize = False
         if ndim == 3 and _FUSED_EXPERT_PATTERNS.search(key):
-            would_quantize = _passes_exclude_filter(key, exclude_patterns)
+            would_quantize = should_quantize_key(key, exclude_patterns, include_patterns)
         elif ndim == 2 and key.endswith(".weight"):
-            would_quantize = _passes_exclude_filter(key, exclude_patterns)
+            would_quantize = should_quantize_key(key, exclude_patterns, include_patterns)
 
         if would_quantize:
             keys_to_quantize.append(key)
@@ -124,8 +164,10 @@ def process_shard(
     device: str = "cpu",
     quantize_only_keys: list[str] | None = None,
     output_format: str = "ct",
+    include_patterns: list[str] | None = None,
+    quant_format: str = "mxfp4",
 ) -> dict[str, str]:
-    """Quantize all eligible weights in one safetensors shard to MXFP4.
+    """Quantize all eligible weights in one safetensors shard.
 
     Args:
         input_path:      Source shard path.
@@ -156,8 +198,10 @@ def process_shard(
     if calibration_stats_path:
         activation_stats = load_calibration_stats(calibration_stats_path)
     output_tensors = {}
+    smoothed_norms: dict[str, torch.Tensor] = {}  # SmoothQuant modified norms
     n_quantized = 0
     n_gamma_used = 0
+    n_smoothed = 0
 
     with safe_open(input_path, framework="pt") as f:
         keys = list(f.keys())
@@ -182,7 +226,7 @@ def process_shard(
             t = f.get_tensor(k)
             handler = get_handler(k, t)
 
-            if handler is not None and handler.should_quantize(k, t, exclude_patterns):
+            if handler is not None and handler.should_quantize(k, t, exclude_patterns, include_patterns):
                 weight_bf16 = handler.prepare_weight(
                     k, t, device, input_format, fp8_block_size, scale_inv_map, f,
                 )
@@ -213,64 +257,99 @@ def process_shard(
 
                 g_dev = gamma.to(device) if gamma is not None else None
 
-                if weight_bf16.ndim == 3:
-                    # Quantize expert-by-expert to avoid 3× FP32 blowup on
-                    # the full [n_experts, out, in] tensor (~64GB peak for 256 experts).
-                    packed_list, scales_list = [], []
-                    for i in range(weight_bf16.shape[0]):
-                        p, s = quantize_mxfp4(weight_bf16[i], scale_percentile, gamma=g_dev)
-                        packed_list.append(p.cpu())
-                        scales_list.append(s.cpu())
-                    packed = torch.stack(packed_list)
-                    scales = torch.stack(scales_list)
-                    del packed_list, scales_list
-                else:
-                    packed, scales = quantize_mxfp4(weight_bf16, scale_percentile, gamma=g_dev)
+                if quant_format == "fp8":
+                    # SmoothQuant: smooth weight columns by activation magnitudes
+                    # and absorb inverse into the preceding layernorm.
+                    if g_dev is not None and weight_bf16.ndim == 2:
+                        norm_key = _smooth_norm_key(k)
+                        if norm_key is not None and norm_key in keys:
+                            norm_w = f.get_tensor(norm_key).float().to(device)
+                            w_col_max = weight_bf16.abs().amax(dim=0).to(device)
+                            alpha = 0.5
+                            s = (g_dev.clamp(min=1e-12) ** alpha) / (
+                                w_col_max.clamp(min=1e-12) ** (1 - alpha)
+                            )
+                            s = s.clamp(min=1e-6)
+                            weight_bf16 = weight_bf16.to(device) / s.unsqueeze(0)
+                            smoothed_norms[norm_key] = (norm_w * s).cpu()
+                            weight_bf16 = weight_bf16.cpu()
+                            n_smoothed += 1
 
-                if isinstance(handler, FusedExpertHandler) and output_format == "ct":
-                    # CT format: output per-expert separate tensors
-                    # Base: "model.layers.X.mlp.experts.gate_up_proj" or ".down_proj"
-                    base = re.sub(r"\.(gate_up_proj|down_proj|gate_proj|up_proj)$", "", k)
-                    n_experts = packed.shape[0]
+                    # FP8 E4M3 per-channel quantization
+                    if weight_bf16.ndim == 3:
+                        q_list, s_list = [], []
+                        for i in range(weight_bf16.shape[0]):
+                            q, s = quantize_fp8(weight_bf16[i], per_channel=True)
+                            q_list.append(q.cpu())
+                            s_list.append(s.cpu())
+                        quantized = torch.stack(q_list)
+                        q_scales = torch.stack(s_list)
+                        del q_list, s_list
+                    else:
+                        quantized, q_scales = quantize_fp8(weight_bf16, per_channel=True)
 
-                    if "gate_up_proj" in k:
-                        # packed shape: [E, 2*N, K//2], scales: [E, 2*N, K//32]
-                        N = packed.shape[1] // 2
-                        for i in range(n_experts):
-                            gate_p = packed[i, :N, :].cpu()
-                            gate_s = scales[i, :N, :].cpu()
-                            up_p = packed[i, N:, :].cpu()
-                            up_s = scales[i, N:, :].cpu()
-                            output_tensors[f"{base}.{i}.gate_proj.weight_packed"] = gate_p
-                            output_tensors[f"{base}.{i}.gate_proj.weight_scale"] = gate_s
-                            output_tensors[f"{base}.{i}.up_proj.weight_packed"] = up_p
-                            output_tensors[f"{base}.{i}.up_proj.weight_scale"] = up_s
-                    elif "down_proj" in k:
-                        for i in range(n_experts):
-                            output_tensors[f"{base}.{i}.down_proj.weight_packed"] = packed[i].cpu()
-                            output_tensors[f"{base}.{i}.down_proj.weight_scale"] = scales[i].cpu()
-                    elif "gate_proj" in k:
-                        for i in range(n_experts):
-                            output_tensors[f"{base}.{i}.gate_proj.weight_packed"] = packed[i].cpu()
-                            output_tensors[f"{base}.{i}.gate_proj.weight_scale"] = scales[i].cpu()
-                    elif "up_proj" in k:
-                        for i in range(n_experts):
-                            output_tensors[f"{base}.{i}.up_proj.weight_packed"] = packed[i].cpu()
-                            output_tensors[f"{base}.{i}.up_proj.weight_scale"] = scales[i].cpu()
+                    weight_key, scale_key = handler.output_keys(k, quant_format="fp8")
+                    output_tensors[weight_key] = quantized.cpu()
+                    output_tensors[scale_key] = q_scales.cpu()
                     n_quantized += 1
                 else:
-                    # Fused format: interleave gate_up and output as w13/w2
-                    if isinstance(handler, FusedExpertHandler) and "gate_up_proj" in k:
-                        packed = FusedExpertHandler.interleave_gate_up(packed)
-                        scales = FusedExpertHandler.interleave_gate_up(scales)
+                    # MXFP4 quantization
+                    if weight_bf16.ndim == 3:
+                        packed_list, scales_list = [], []
+                        for i in range(weight_bf16.shape[0]):
+                            p, s = quantize_mxfp4(weight_bf16[i], scale_percentile, gamma=g_dev)
+                            packed_list.append(p.cpu())
+                            scales_list.append(s.cpu())
+                        packed = torch.stack(packed_list)
+                        scales = torch.stack(scales_list)
+                        del packed_list, scales_list
+                    else:
+                        packed, scales = quantize_mxfp4(weight_bf16, scale_percentile, gamma=g_dev)
 
-                    packed_key, scale_key = handler.output_keys(k)
-                    output_tensors[packed_key] = packed.cpu()
-                    output_tensors[scale_key] = scales.cpu()
-                    n_quantized += 1
+                    if isinstance(handler, FusedExpertHandler) and output_format == "ct":
+                        # CT format: output per-expert separate tensors
+                        base = re.sub(r"\.(gate_up_proj|down_proj|gate_proj|up_proj)$", "", k)
+                        n_experts = packed.shape[0]
+
+                        if "gate_up_proj" in k:
+                            N = packed.shape[1] // 2
+                            for i in range(n_experts):
+                                gate_p = packed[i, :N, :].cpu()
+                                gate_s = scales[i, :N, :].cpu()
+                                up_p = packed[i, N:, :].cpu()
+                                up_s = scales[i, N:, :].cpu()
+                                output_tensors[f"{base}.{i}.gate_proj.weight_packed"] = gate_p
+                                output_tensors[f"{base}.{i}.gate_proj.weight_scale"] = gate_s
+                                output_tensors[f"{base}.{i}.up_proj.weight_packed"] = up_p
+                                output_tensors[f"{base}.{i}.up_proj.weight_scale"] = up_s
+                        elif "down_proj" in k:
+                            for i in range(n_experts):
+                                output_tensors[f"{base}.{i}.down_proj.weight_packed"] = packed[i].cpu()
+                                output_tensors[f"{base}.{i}.down_proj.weight_scale"] = scales[i].cpu()
+                        elif "gate_proj" in k:
+                            for i in range(n_experts):
+                                output_tensors[f"{base}.{i}.gate_proj.weight_packed"] = packed[i].cpu()
+                                output_tensors[f"{base}.{i}.gate_proj.weight_scale"] = scales[i].cpu()
+                        elif "up_proj" in k:
+                            for i in range(n_experts):
+                                output_tensors[f"{base}.{i}.up_proj.weight_packed"] = packed[i].cpu()
+                                output_tensors[f"{base}.{i}.up_proj.weight_scale"] = scales[i].cpu()
+                        n_quantized += 1
+                    else:
+                        if isinstance(handler, FusedExpertHandler) and "gate_up_proj" in k:
+                            packed = FusedExpertHandler.interleave_gate_up(packed)
+                            scales = FusedExpertHandler.interleave_gate_up(scales)
+
+                        packed_key, scale_key = handler.output_keys(k)
+                        output_tensors[packed_key] = packed.cpu()
+                        output_tensors[scale_key] = scales.cpu()
+                        n_quantized += 1
 
             else:
-                if input_format == "fp8" and t.dtype == torch.float8_e4m3fn:
+                if k in smoothed_norms:
+                    # SmoothQuant: use the smoothed layernorm weights
+                    output_tensors[k] = smoothed_norms[k]
+                elif input_format == "fp8" and t.dtype == torch.float8_e4m3fn:
                     scale_key = scale_inv_map.get(k)
                     if scale_key is not None:
                         output_tensors[k] = dequant_fp8_block(t, f.get_tensor(scale_key), fp8_block_size)
@@ -278,6 +357,12 @@ def process_shard(
                         output_tensors[k] = t.to(torch.bfloat16)
                 else:
                     output_tensors[k] = t
+
+    # Apply any remaining SmoothQuant norms that weren't in the passthrough loop
+    # (norm key in a different shard or processed before the linear weight)
+    for norm_key, smoothed in smoothed_norms.items():
+        if norm_key in output_tensors:
+            output_tensors[norm_key] = smoothed
 
     result_map = {name: os.path.basename(output_path) for name in output_tensors}
 
@@ -291,6 +376,7 @@ def process_shard(
     in_mb = os.path.getsize(input_path) / 1e6
     out_mb = os.path.getsize(output_path) / 1e6
     gamma_note = f", {n_gamma_used} with γ" if (gamma_by_layer or activation_stats) else ""
-    print(f"  {shard_name}: {in_mb:.0f}MB → {out_mb:.0f}MB ({n_quantized} quantized{gamma_note})")
+    smooth_note = f", {n_smoothed} smoothed" if n_smoothed else ""
+    print(f"  {shard_name}: {in_mb:.0f}MB → {out_mb:.0f}MB ({n_quantized} quantized{gamma_note}{smooth_note})")
 
     return result_map
