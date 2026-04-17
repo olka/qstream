@@ -72,6 +72,20 @@ class TestShouldQuantize:
             ["*embed_tokens*"],
         ) is False
 
+    def test_shared_expert_gate_excluded(self):
+        # shared_expert_gate is a [1, hidden] gating weight — must stay BF16.
+        # The plain ".mlp.gate." pattern does NOT cover it, so the exclude list
+        # must carry "*shared_expert*" explicitly.
+        key = "model.language_model.layers.0.mlp.shared_expert_gate.weight"
+        assert should_quantize(key, ["*.mlp.gate."]) is True
+        assert should_quantize(key, ["*shared_expert*"]) is False
+
+    def test_mlp_gate_still_excluded_alongside_shared_expert(self):
+        # Adding "*shared_expert*" must not stop "*.mlp.gate." from matching
+        # the routing gate.
+        key = "model.language_model.layers.0.mlp.gate.weight"
+        assert should_quantize(key, ["*.mlp.gate.", "*shared_expert*"]) is False
+
 
 class TestDetectInputFormat:
     def test_fp16_model(self):
@@ -216,6 +230,36 @@ class TestProcessShard:
             # Fused format: interleaved w13/w2
             assert "model.layers.0.mlp.experts.w13_weight" in result
             assert "model.layers.0.mlp.experts.w13_weight_scale" in result
+
+    def test_3d_fused_excluded_split_per_expert_ct(self):
+        # When a 3D fused expert tensor is excluded from quantization in CT mode,
+        # it must be split into per-expert .weight BF16 tensors so vLLM's
+        # per-expert / MTP loaders can consume it.
+        with tempfile.TemporaryDirectory() as tmpdir:
+            input_path = os.path.join(tmpdir, "input.safetensors")
+            output_path = os.path.join(tmpdir, "output.safetensors")
+
+            save_file({
+                "mtp.layers.0.mlp.experts.gate_up_proj": torch.randn(4, 64, 128, dtype=torch.bfloat16),
+                "mtp.layers.0.mlp.experts.down_proj": torch.randn(4, 128, 32, dtype=torch.bfloat16),
+            }, input_path)
+
+            result = process_shard(
+                input_path, output_path,
+                exclude_patterns=["*mtp*"], input_format="fp16",
+                output_format="ct",
+            )
+
+            # Per-expert BF16 .weight tensors — not the 3D fused passthrough.
+            for i in range(4):
+                assert f"mtp.layers.0.mlp.experts.{i}.gate_proj.weight" in result
+                assert f"mtp.layers.0.mlp.experts.{i}.up_proj.weight" in result
+                assert f"mtp.layers.0.mlp.experts.{i}.down_proj.weight" in result
+                # Must NOT be quantized.
+                assert f"mtp.layers.0.mlp.experts.{i}.gate_proj.weight_packed" not in result
+            # Original 3D keys must be gone.
+            assert "mtp.layers.0.mlp.experts.gate_up_proj" not in result
+            assert "mtp.layers.0.mlp.experts.down_proj" not in result
 
     def test_passthrough_excluded(self):
         with tempfile.TemporaryDirectory() as tmpdir:

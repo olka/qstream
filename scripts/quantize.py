@@ -45,7 +45,15 @@ def main():
     parser.add_argument(
         "--exclude_layers",
         nargs="*",
-        default=["*self_attn*", "*.mlp.gate.", "*lm_head*", "*embed_tokens*"],
+        default=[
+            "*self_attn*",
+            "*.mlp.gate.",
+            "*shared_expert*",
+            "*lm_head*",
+            "*embed_tokens*",
+            "*visual*",
+            "*mtp*",
+        ],
         help="Substring patterns for tensors to exclude from quantization",
     )
     parser.add_argument("--fp8_block_size", type=int, default=128)
