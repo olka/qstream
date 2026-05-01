@@ -5,6 +5,7 @@ import os
 import tempfile
 
 import torch
+from safetensors import safe_open
 from safetensors.torch import save_file
 
 from qstream.shard import (
@@ -233,6 +234,144 @@ class TestProcessShard:
 
             assert "model.layers.0.self_attn.q_proj.weight" in result
             assert "model.layers.0.self_attn.q_proj.weight_packed" not in result
+
+    def test_fp8_passthrough_preserves_format(self):
+        """FP8 tensors excluded from quantization keep weight + renamed scale companion."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            input_path = os.path.join(tmpdir, "input.safetensors")
+            output_path = os.path.join(tmpdir, "output.safetensors")
+
+            w_fp8 = torch.randn(64, 128, dtype=torch.bfloat16).to(torch.float8_e4m3fn)
+            s_block = torch.ones(1, 1, dtype=torch.float32)
+
+            save_file({
+                "model.layers.0.self_attn.q_proj.weight": w_fp8,
+                "model.layers.0.self_attn.q_proj.weight_scale_inv": s_block,
+            }, input_path)
+
+            result = process_shard(
+                input_path, output_path,
+                exclude_patterns=["*self_attn*"], input_format="fp8",
+            )
+
+            assert "model.layers.0.self_attn.q_proj.weight" in result
+            assert "model.layers.0.self_attn.q_proj.weight_scale" in result
+            assert "model.layers.0.self_attn.q_proj.weight_scale_inv" not in result
+            assert "model.layers.0.self_attn.q_proj.weight_packed" not in result
+
+            with safe_open(output_path, framework="pt") as f:
+                assert f.get_tensor("model.layers.0.self_attn.q_proj.weight").dtype == torch.float8_e4m3fn
+
+    def test_fp8_passthrough_per_tensor_scale(self):
+        """Per-tensor scalar scale (Mistral-style) survives passthrough as weight_scale."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            input_path = os.path.join(tmpdir, "input.safetensors")
+            output_path = os.path.join(tmpdir, "output.safetensors")
+
+            w_fp8 = torch.randn(64, 128, dtype=torch.bfloat16).to(torch.float8_e4m3fn)
+            s_scalar = torch.tensor(0.000125, dtype=torch.bfloat16)
+
+            save_file({
+                "model.layers.0.self_attn.q_proj.weight": w_fp8,
+                "model.layers.0.self_attn.q_proj.weight_scale_inv": s_scalar,
+            }, input_path)
+
+            result = process_shard(
+                input_path, output_path,
+                exclude_patterns=["*self_attn*"], input_format="fp8",
+            )
+
+            with safe_open(output_path, framework="pt") as f:
+                assert f.get_tensor("model.layers.0.self_attn.q_proj.weight").dtype == torch.float8_e4m3fn
+                preserved_scale = f.get_tensor("model.layers.0.self_attn.q_proj.weight_scale")
+                assert preserved_scale.shape == (1,)
+                assert preserved_scale.dtype == torch.float32
+
+    def test_fp8_passthrough_renames_activation_scale(self):
+        """activation_scale companion is renamed to input_scale on passthrough."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            input_path = os.path.join(tmpdir, "input.safetensors")
+            output_path = os.path.join(tmpdir, "output.safetensors")
+
+            w_fp8 = torch.randn(64, 128, dtype=torch.bfloat16).to(torch.float8_e4m3fn)
+            ws = torch.tensor(0.000125, dtype=torch.bfloat16)
+            ascale = torch.tensor(0.5, dtype=torch.bfloat16)
+
+            save_file({
+                "model.layers.0.self_attn.q_proj.weight": w_fp8,
+                "model.layers.0.self_attn.q_proj.weight_scale_inv": ws,
+                "model.layers.0.self_attn.q_proj.activation_scale": ascale,
+            }, input_path)
+
+            result = process_shard(
+                input_path, output_path,
+                exclude_patterns=["*self_attn*"], input_format="fp8",
+            )
+
+            assert "model.layers.0.self_attn.q_proj.input_scale" in result
+            assert "model.layers.0.self_attn.q_proj.activation_scale" not in result
+            with safe_open(output_path, framework="pt") as f:
+                preserved_act = f.get_tensor("model.layers.0.self_attn.q_proj.input_scale")
+                assert preserved_act.shape == (1,)
+                assert preserved_act.dtype == torch.float32
+                assert (preserved_act - 0.5).abs().item() < 1e-3
+
+    def test_expert_quantize_set_selective(self):
+        """Selective per-expert: quantize one expert, keep another in FP8."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            input_path = os.path.join(tmpdir, "input.safetensors")
+            output_path = os.path.join(tmpdir, "output.safetensors")
+
+            save_file({
+                # Expert 0: should be quantized to MXFP4
+                "model.layers.0.block_sparse_moe.experts.0.w1.weight":
+                    torch.randn(64, 128, dtype=torch.bfloat16),
+                # Expert 1: should stay FP8 (not in quantize set)
+                "model.layers.0.block_sparse_moe.experts.1.w1.weight":
+                    torch.randn(64, 128, dtype=torch.bfloat16),
+            }, input_path)
+
+            # Only quantize expert 0 in layer 0
+            result = process_shard(
+                input_path, output_path,
+                exclude_patterns=[], input_format="fp16",
+                expert_quantize_set={(0, 0)},
+            )
+
+            # Expert 0: MXFP4 quantized
+            assert "model.layers.0.block_sparse_moe.experts.0.w1.weight_packed" in result
+            assert "model.layers.0.block_sparse_moe.experts.0.w1.weight_scale" in result
+
+            # Expert 1: kept as-is (BF16 passthrough since input is fp16)
+            assert "model.layers.0.block_sparse_moe.experts.1.w1.weight" in result
+            assert "model.layers.0.block_sparse_moe.experts.1.w1.weight_packed" not in result
+
+    def test_expert_quantize_set_fp8_passthrough(self):
+        """FP8 experts not in quantize set keep weight + scale_inv."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            input_path = os.path.join(tmpdir, "input.safetensors")
+            output_path = os.path.join(tmpdir, "output.safetensors")
+
+            # Simulate FP8 expert weights
+            w = torch.randn(64, 128, dtype=torch.bfloat16).to(torch.float8_e4m3fn)
+            s = torch.ones(1, 1, dtype=torch.float32)  # block scale
+
+            save_file({
+                "model.layers.0.block_sparse_moe.experts.0.w1.weight": w,
+                "model.layers.0.block_sparse_moe.experts.0.w1.weight_scale_inv": s,
+            }, input_path)
+
+            # Empty set = no experts to quantize
+            result = process_shard(
+                input_path, output_path,
+                exclude_patterns=[], input_format="fp8",
+                expert_quantize_set=set(),
+            )
+
+            assert "model.layers.0.block_sparse_moe.experts.0.w1.weight" in result
+            assert "model.layers.0.block_sparse_moe.experts.0.w1.weight_scale" in result
+            assert "model.layers.0.block_sparse_moe.experts.0.w1.weight_scale_inv" not in result
+            assert "model.layers.0.block_sparse_moe.experts.0.w1.weight_packed" not in result
 
     def test_quantize_only_keys(self):
         with tempfile.TemporaryDirectory() as tmpdir:

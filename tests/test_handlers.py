@@ -30,11 +30,11 @@ class TestPassesExcludeFilter:
         # *.mlp.gate. should match router but not gate_proj
         assert _passes_exclude_filter(
             "model.layers.0.mlp.gate.weight",
-            ["*.mlp.gate."],
+            ["*.mlp.gate.*"],
         ) is False
         assert _passes_exclude_filter(
             "model.layers.0.mlp.experts.gate_up_proj",
-            ["*.mlp.gate."],
+            ["*.mlp.gate.*"],
         ) is True
 
 

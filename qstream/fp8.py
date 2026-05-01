@@ -8,16 +8,23 @@ def dequant_fp8_block(
     scale_inv: torch.Tensor,
     block_size: int = 128,
 ) -> torch.Tensor:
-    """Dequantize FP8 weights with block scales to BF16.
+    """Dequantize FP8 weights to BF16.
+
+    Auto-dispatches on `scale_inv` rank:
+      - 0-d scalar → per-tensor static FP8 (Mistral-style)
+      - 2-d        → block-scaled FP8 (DeepSeek/Qwen-style, `block_size` × `block_size`)
 
     Args:
         weight_fp8: [out, in] float8_e4m3fn
-        scale_inv:  [out//block_size, in//block_size] float32 inverse scales
-        block_size: FP8 quantization block size (128 for most models)
+        scale_inv:  [] (per-tensor) or [out//block_size, in//block_size] inverse scales
+        block_size: FP8 quantization block size (128 for most models, ignored for per-tensor)
 
     Returns:
         [out, in] bfloat16
     """
+    if scale_inv.ndim == 0:
+        return (weight_fp8.to(torch.float32) * scale_inv.to(torch.float32)).to(torch.bfloat16)
+
     out_f, in_f = weight_fp8.shape
     n_blocks_out, n_blocks_in = scale_inv.shape
 

@@ -15,8 +15,7 @@ _libc = ctypes.CDLL("libc.so.6")
 
 from .calibrate import load_calibration_stats
 from .core import BLOCK_SIZE, quantize_fp8, quantize_mxfp4
-from .fp8 import dequant_fp8_block
-from .gamma import extract_layer_index
+from .gamma import extract_expert_index, extract_layer_index
 from .handlers import (
     FusedExpertHandler,
     _FUSED_EXPERT_PATTERNS,
@@ -24,6 +23,18 @@ from .handlers import (
     get_handler,
     should_quantize_key,
 )
+
+
+def _normalize_fp8_scale(scale: torch.Tensor) -> torch.Tensor:
+    """Normalize an FP8 scale to vLLM's compressed-tensors expectation: float32, rank-1.
+
+    vLLM's PerTensorScaleParameter handles both scalar and shape (1,) sources, but FP32
+    is the consistent expected dtype across loader paths.
+    """
+    s = scale.to(torch.float32)
+    if s.ndim == 0:
+        s = s.unsqueeze(0)
+    return s
 
 
 def _smooth_norm_key(key: str) -> str | None:
@@ -166,6 +177,7 @@ def process_shard(
     output_format: str = "ct",
     include_patterns: list[str] | None = None,
     quant_format: str = "mxfp4",
+    expert_quantize_set: set[tuple[int, int]] | None = None,
 ) -> dict[str, str]:
     """Quantize all eligible weights in one safetensors shard.
 
@@ -202,21 +214,27 @@ def process_shard(
     n_quantized = 0
     n_gamma_used = 0
     n_smoothed = 0
+    n_fp8_kept = 0
 
     with safe_open(input_path, framework="pt") as f:
         keys = list(f.keys())
 
-        # Build weight → scale_inv lookup for FP8 shards
+        # Build weight → scale_inv and weight → activation_scale lookups for FP8 shards
         scale_inv_map: dict[str, str] = {}
+        act_scale_map: dict[str, str] = {}
         if input_format == "fp8":
             for k in keys:
                 if k.endswith(".weight_scale_inv"):
                     scale_inv_map[k.replace(".weight_scale_inv", ".weight")] = k
+                elif k.endswith(".activation_scale"):
+                    act_scale_map[k.replace(".activation_scale", ".weight")] = k
+                elif k.endswith(".input_scale"):
+                    act_scale_map[k.replace(".input_scale", ".weight")] = k
 
         quantize_only_set = set(quantize_only_keys) if quantize_only_keys is not None else None
 
         for k in keys:
-            if k.endswith(".weight_scale_inv"):
+            if k.endswith(".weight_scale_inv") or k.endswith(".activation_scale"):
                 continue
 
             # In quantize-only mode, skip keys we don't need to process
@@ -224,6 +242,28 @@ def process_shard(
                 continue
 
             t = f.get_tensor(k)
+
+            # Selective per-expert quantization: if expert_quantize_set is
+            # provided, only quantize experts in the set. Others keep FP8.
+            if expert_quantize_set is not None:
+                expert_idx = extract_expert_index(k)
+                layer_idx = extract_layer_index(k)
+                if expert_idx is not None and layer_idx is not None:
+                    if (layer_idx, expert_idx) not in expert_quantize_set:
+                        output_tensors[k] = t
+                        scale_key = scale_inv_map.get(k)
+                        if scale_key:
+                            output_tensors[k.replace(".weight", ".weight_scale")] = (
+                                _normalize_fp8_scale(f.get_tensor(scale_key))
+                            )
+                            act_key = act_scale_map.get(k)
+                            if act_key is not None:
+                                output_tensors[k.replace(".weight", ".input_scale")] = (
+                                    _normalize_fp8_scale(f.get_tensor(act_key))
+                                )
+                        n_fp8_kept += 1
+                        continue
+
             handler = get_handler(k, t)
 
             if handler is not None and handler.should_quantize(k, t, exclude_patterns, include_patterns):
@@ -352,7 +392,15 @@ def process_shard(
                 elif input_format == "fp8" and t.dtype == torch.float8_e4m3fn:
                     scale_key = scale_inv_map.get(k)
                     if scale_key is not None:
-                        output_tensors[k] = dequant_fp8_block(t, f.get_tensor(scale_key), fp8_block_size)
+                        output_tensors[k] = t
+                        output_tensors[k.replace(".weight", ".weight_scale")] = (
+                            _normalize_fp8_scale(f.get_tensor(scale_key))
+                        )
+                        act_key = act_scale_map.get(k)
+                        if act_key is not None:
+                            output_tensors[k.replace(".weight", ".input_scale")] = (
+                                _normalize_fp8_scale(f.get_tensor(act_key))
+                            )
                     else:
                         output_tensors[k] = t.to(torch.bfloat16)
                 else:
@@ -377,6 +425,7 @@ def process_shard(
     out_mb = os.path.getsize(output_path) / 1e6
     gamma_note = f", {n_gamma_used} with γ" if (gamma_by_layer or activation_stats) else ""
     smooth_note = f", {n_smoothed} smoothed" if n_smoothed else ""
-    print(f"  {shard_name}: {in_mb:.0f}MB → {out_mb:.0f}MB ({n_quantized} quantized{gamma_note}{smooth_note})")
+    fp8_note = f", {n_fp8_kept} FP8 kept" if n_fp8_kept else ""
+    print(f"  {shard_name}: {in_mb:.0f}MB → {out_mb:.0f}MB ({n_quantized} quantized{fp8_note}{gamma_note}{smooth_note})")
 
     return result_map

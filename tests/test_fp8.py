@@ -46,3 +46,21 @@ class TestDequantFp8Block:
         # First 128 rows scaled by 1.0, next 128 by 2.0
         assert (result[:128].float() - 1.0).abs().max() < 0.1
         assert (result[128:].float() - 2.0).abs().max() < 0.1
+
+    def test_per_tensor_scalar_scale(self):
+        """0-d scalar scale_inv (Mistral-style per-tensor static FP8)."""
+        weight = torch.ones(1024, 12288, dtype=torch.float8_e4m3fn)
+        scale_inv = torch.tensor(2.5, dtype=torch.bfloat16)
+        result = dequant_fp8_block(weight, scale_inv, block_size=128)
+        assert result.dtype == torch.bfloat16
+        assert result.shape == (1024, 12288)
+        assert (result.float() - 2.5).abs().max() < 0.05
+
+    def test_per_tensor_irregular_shape(self):
+        """Per-tensor scaling works for any shape, including non-divisible-by-128."""
+        weight = torch.ones(1024, 12288, dtype=torch.float8_e4m3fn)
+        scale_inv = torch.tensor(0.000125, dtype=torch.bfloat16)
+        result = dequant_fp8_block(weight, scale_inv)
+        # bfloat16 representation of 0.000125 ~ 0.0001249
+        assert result.shape == (1024, 12288)
+        assert (result.float() - float(scale_inv)).abs().max() < 1e-5

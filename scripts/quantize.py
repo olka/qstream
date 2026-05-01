@@ -24,12 +24,15 @@ import argparse
 import json
 import multiprocessing as mp
 import os
+import re
 import resource
 import signal
 import shutil
 import time
 from concurrent.futures import ProcessPoolExecutor, wait, FIRST_COMPLETED
 from pathlib import Path
+
+from safetensors import safe_open
 
 # Raise the open-file-descriptor limit to the hard cap.
 # Default soft limit (1024) is too low for large models with many shards and workers.
@@ -65,6 +68,9 @@ def main():
     parser.add_argument("--workers", type=int, default=4)
     parser.add_argument("--threads_per_worker", type=int, default=0,
                         help="0 = auto (cpu_count / workers)")
+    parser.add_argument("--shard_timeout", type=int, default=1800,
+                        help="Seconds without any shard completing before assuming "
+                             "deadlock and retrying. Bump for very large shards.")
     parser.add_argument("--scale_percentile", type=float, default=99.5,
                         help="Anchor percentile for MSE candidate generation")
     parser.add_argument("--no_activation_aware", action="store_true",
@@ -82,6 +88,14 @@ def main():
                         dest="output_format",
                         help="Output format: 'ct' (compressed-tensors per-expert, stock vLLM) or "
                              "'fused' (w13/w2, needs vLLM fork)")
+    parser.add_argument("--expert_config", default=None,
+                        help="Path to expert_errors.json from analyze_experts.py. "
+                             "Enables selective per-expert quantization: low-error "
+                             "experts → MXFP4, high-error experts → keep FP8.")
+    parser.add_argument("--expert_budget_gb", type=float, default=None,
+                        help="Target GB to save by MXFP4-quantizing experts. "
+                             "Requires --expert_config. Selects the N lowest-error "
+                             "experts needed to reach the target savings.")
     args = parser.parse_args()
 
     if args.threads_per_worker == 0:
@@ -147,6 +161,33 @@ def main():
                 print("  No input_layernorm.weight found — using unweighted MSE")
     else:
         print("γ-weighted MSE:   disabled")
+
+    # Selective per-expert quantization
+    expert_quantize_set = None
+    if args.expert_config:
+        with open(args.expert_config) as f:
+            expert_data = json.load(f)
+        all_experts = expert_data["experts_by_error"]  # sorted ascending by error
+        savings_per_expert = expert_data["savings_per_expert_mb"]
+
+        if args.expert_budget_gb:
+            n_needed = min(
+                int(args.expert_budget_gb * 1024 / savings_per_expert) + 1,
+                len(all_experts),
+            )
+            selected = all_experts[:n_needed]
+            actual_savings = n_needed * savings_per_expert / 1024
+            worst_error = selected[-1]["rel_error"] if selected else 0
+            print(f"Expert config:    {n_needed}/{len(all_experts)} experts → MXFP4 "
+                  f"(saves {actual_savings:.1f} GB, worst error {worst_error:.6f})")
+        else:
+            selected = all_experts
+            print(f"Expert config:    all {len(all_experts)} experts → MXFP4")
+
+        expert_quantize_set = {(e["layer"], e["expert"]) for e in selected}
+        n_kept = len(all_experts) - len(selected)
+        if n_kept > 0:
+            print(f"                  {n_kept} experts kept in FP8")
 
     # Zero-copy passthrough: for BF16 models, symlink shards with unchanged
     # tensors instead of reading and rewriting them.
@@ -222,8 +263,7 @@ def main():
     # Forked processes inherit the parent's CUDA context, causing contention.
     mp_ctx = mp.get_context("spawn") if args.device != "cpu" else None
 
-    # Per-shard timeout: if no shard completes within this window, assume deadlock.
-    shard_timeout = 300
+    shard_timeout = args.shard_timeout
 
     remaining = list(shards_to_process)
     t0 = time.monotonic()
@@ -253,6 +293,7 @@ def main():
                 args.output_format,
                 args.include_layers,
                 args.quant_format,
+                expert_quantize_set,
             )
             futures[fut] = (src_name, out_shard_name)
 
@@ -319,24 +360,21 @@ def main():
     config_path = output_dir / "config.json"
     with open(config_path) as f:
         config = json.load(f)
-    # For MXFP4: modules with plain .weight in the output were not quantized.
-    if args.quant_format != "fp8":
-        ignore_modules = sorted(
-            k[: -len(".weight")]
-            for k in final_weight_map
-            if k.endswith(".weight")
-        )
+
+    fp8_modules = sorted(
+        k[: -len(".weight")]
+        for k in final_weight_map
+        if k.endswith(".weight")
+        and k.replace(".weight", ".weight_scale") in final_weight_map
+    )
+    fp8_modules_set = set(fp8_modules)
+    ignore_modules = sorted(
+        k[: -len(".weight")]
+        for k in final_weight_map
+        if k.endswith(".weight") and k[: -len(".weight")] not in fp8_modules_set
+    )
+
     if args.quant_format == "fp8":
-        # Build ignore list: regex patterns in vLLM-space module names.
-        # re: prefixed patterns are preserved by apply_vllm_mapper and matched
-        # directly against vLLM module paths (not HF checkpoint names).
-        fp8_ignore = ["lm_head"]
-        if args.exclude_layers:
-            for pat in args.exclude_layers:
-                # Convert glob-like *name* patterns to regex for common cases
-                stripped = pat.strip("*")
-                if stripped:
-                    fp8_ignore.append(f"re:{stripped}")
         config["quantization_config"] = {
             "quant_method": "compressed-tensors",
             "format": "float-quantized",
@@ -352,7 +390,7 @@ def main():
                     },
                 }
             },
-            "ignore": fp8_ignore,
+            "ignore": ignore_modules,
         }
     elif any("w13_weight" in k for k in final_weight_map) and args.output_format == "fused":
         config["quantization_config"] = {"quant_method": "mxfp4"}
@@ -374,6 +412,52 @@ def main():
             },
             "ignore": ignore_modules,
         }
+
+    if fp8_modules and "config_groups" in config["quantization_config"]:
+        sample_scale_key = fp8_modules[0] + ".weight_scale"
+        sample_shard = output_dir / final_weight_map[sample_scale_key]
+        with safe_open(str(sample_shard), framework="pt") as f:
+            per_tensor = f.get_tensor(sample_scale_key).numel() == 1
+        has_input_scale = any(
+            (m + ".input_scale") in final_weight_map for m in fp8_modules
+        )
+
+        fp8_targets: list[str] = []
+        for pat in (args.exclude_layers or []):
+            stripped = pat.strip("*")
+            if not stripped:
+                continue
+            probe = re.compile(re.escape(stripped))
+            if any(probe.search(m) for m in fp8_modules):
+                fp8_targets.append(f"re:.*{re.escape(stripped)}.*")
+        if not fp8_targets:
+            fp8_targets = ["Linear"]
+
+        fp8_group: dict = {
+            "targets": fp8_targets,
+            "format": "float-quantized",
+            "weights": {
+                "num_bits": 8,
+                "type": "float",
+                "strategy": "tensor" if per_tensor else "block",
+                "symmetric": True,
+                "dynamic": False,
+            },
+        }
+        if not per_tensor:
+            fp8_group["weights"]["block_structure"] = [
+                args.fp8_block_size, args.fp8_block_size
+            ]
+        if has_input_scale:
+            fp8_group["input_activations"] = {
+                "num_bits": 8,
+                "type": "float",
+                "strategy": "tensor",
+                "symmetric": True,
+                "dynamic": False,
+            }
+        config["quantization_config"]["config_groups"]["group_1"] = fp8_group
+
     with open(config_path, "w") as f:
         json.dump(config, f, indent=2)
 
