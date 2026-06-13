@@ -270,7 +270,28 @@ def process_shard(
                     n_quantized += 1
 
             else:
-                if input_format == "fp8" and t.dtype == torch.float8_e4m3fn:
+                if isinstance(handler, FusedExpertHandler) and output_format == "ct":
+                    # 3D fused expert tensor excluded from quantization.
+                    # CT consumers (stock vLLM, MTP draft loader) expect per-expert
+                    # 2D .weight tensors — not the [E, N, K] 3D fused layout.
+                    base = re.sub(r"\.(gate_up_proj|down_proj|gate_proj|up_proj)$", "", k)
+                    n_experts = t.shape[0]
+                    t_bf16 = t.to(torch.bfloat16)
+                    if "gate_up_proj" in k:
+                        N = t.shape[1] // 2
+                        for i in range(n_experts):
+                            output_tensors[f"{base}.{i}.gate_proj.weight"] = t_bf16[i, :N, :].contiguous()
+                            output_tensors[f"{base}.{i}.up_proj.weight"] = t_bf16[i, N:, :].contiguous()
+                    elif "down_proj" in k:
+                        for i in range(n_experts):
+                            output_tensors[f"{base}.{i}.down_proj.weight"] = t_bf16[i].contiguous()
+                    elif "gate_proj" in k:
+                        for i in range(n_experts):
+                            output_tensors[f"{base}.{i}.gate_proj.weight"] = t_bf16[i].contiguous()
+                    elif "up_proj" in k:
+                        for i in range(n_experts):
+                            output_tensors[f"{base}.{i}.up_proj.weight"] = t_bf16[i].contiguous()
+                elif input_format == "fp8" and t.dtype == torch.float8_e4m3fn:
                     scale_key = scale_inv_map.get(k)
                     if scale_key is not None:
                         output_tensors[k] = dequant_fp8_block(t, f.get_tensor(scale_key), fp8_block_size)
