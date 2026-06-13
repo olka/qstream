@@ -75,6 +75,27 @@ class TestBuildQuantizationConfig:
         assert w["group_size"] == 32
         assert w["symmetric"] is True
 
+    def test_block_fp8_group_schema(self):
+        """fp8_kind='block' (Step-3.7/DeepSeek) emits a 128x128 block-FP8 group
+        with float scales (no scale_dtype), not the e8m0 MXFP8 group."""
+        from qstream.output import build_quantization_config
+        L = "model.layers.7"
+        c = build_quantization_config(
+            mxfp4_modules=[f"{L}.moe.experts.0.gate_proj"],
+            fp8_modules=[f"{L}.self_attn.q_proj", f"{L}.mlp.gate_proj"],
+            ignore_modules=["lm_head"],
+            fp8_kind="block", fp8_block_size=128,
+        )
+        g = c["config_groups"]["group_1"]
+        assert g["format"] == "float-quantized"
+        w = g["weights"]
+        assert w["num_bits"] == 8 and w["strategy"] == "block"
+        assert w["block_structure"] == [128, 128]
+        assert "scale_dtype" not in w  # float scales, not e8m0
+        # merged-target fix still applies: qkv_proj/gate_up_proj must match
+        assert _re_match(g["targets"], f"{L}.self_attn.qkv_proj")
+        assert _re_match(g["targets"], f"{L}.mlp.gate_up_proj")
+
     def test_mxfp8_group_schema(self):
         g = self._cfg()["config_groups"]["group_1"]
         assert g["format"] == "mxfp8-quantized"

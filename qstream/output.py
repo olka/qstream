@@ -95,23 +95,54 @@ def _merged_targets(modules: list[str]) -> list[str]:
     return _dedup(out)
 
 
+def _fp8_group(modules: list[str], fp8_kind: str, fp8_block_size: int) -> dict:
+    """Config group for FP8 layers kept at native 8-bit precision.
+
+    `fp8_kind="mxfp8"` → OCP MXFP8 (group-32, uint8 e8m0 scales; M3-style). The
+    `scale_dtype` is what makes vLLM's `_is_mxfp8` pick the MXFP8 scheme.
+    `fp8_kind="block"` → DeepSeek/Step-style block FP8 (128×128 float scales).
+    """
+    targets = _dedup(_targets(modules) + _merged_targets(modules))
+    if fp8_kind == "mxfp8":
+        return {
+            "targets": targets,
+            "format": "mxfp8-quantized",
+            "weights": {
+                "num_bits": 8, "type": "float", "strategy": "group",
+                "group_size": 32, "symmetric": True, "scale_dtype": "torch.uint8",
+            },
+        }
+    return {  # block FP8
+        "targets": targets,
+        "format": "float-quantized",
+        "weights": {
+            "num_bits": 8, "type": "float", "strategy": "block",
+            "block_structure": [fp8_block_size, fp8_block_size],
+            "symmetric": True, "dynamic": False,
+        },
+    }
+
+
 def build_quantization_config(
     mxfp4_modules: list[str],
-    mxfp8_modules: list[str],
+    fp8_modules: list[str],
     ignore_modules: list[str],
+    *,
+    fp8_kind: str = "mxfp8",
+    fp8_block_size: int = 128,
 ) -> dict:
     """Assemble a compressed-tensors mixed-precision quantization config.
 
     Two config groups are emitted:
       group_0 — MXFP4 (num_bits 4, group_size 32) for the routed experts.
-      group_1 — MXFP8 (num_bits 8, group_size 32, scale_dtype torch.uint8) for the
-                FP8 layers kept at native precision (attention, dense MLP, shared
-                experts). The `scale_dtype` field is what makes vLLM's `_is_mxfp8`
-                select the MXFP8 scheme rather than plain block FP8.
+      group_1 — FP8 (num_bits 8) for the layers kept at native precision (attention,
+                dense MLP, shared experts). `fp8_kind` selects MXFP8 (M3, e8m0) or
+                block FP8 (Step-3.7/DeepSeek, 128×128 float scales).
 
-    `targets` are layer-index-agnostic regexes; the two groups are disjoint and
-    `ignore` covers everything left unquantized (router gate, lm_head, embeddings,
-    vision tower, projector).
+    `targets` are layer-index-agnostic regexes and include vLLM's *merged* runtime
+    modules (`qkv_proj`, `gate_up_proj`) — without those the fused linears load
+    unquantized. The two groups are disjoint; `ignore` covers everything left
+    unquantized (router gate, lm_head, embeddings, vision tower, projector).
     """
     config_groups: dict[str, dict] = {}
     if mxfp4_modules:
@@ -126,19 +157,8 @@ def build_quantization_config(
                 "symmetric": True,
             },
         }
-    if mxfp8_modules:
-        config_groups["group_1"] = {
-            "targets": _dedup(_targets(mxfp8_modules) + _merged_targets(mxfp8_modules)),
-            "format": "mxfp8-quantized",
-            "weights": {
-                "num_bits": 8,
-                "type": "float",
-                "strategy": "group",
-                "group_size": 32,
-                "symmetric": True,
-                "scale_dtype": "torch.uint8",
-            },
-        }
+    if fp8_modules:
+        config_groups["group_1"] = _fp8_group(fp8_modules, fp8_kind, fp8_block_size)
     return {
         "quant_method": "compressed-tensors",
         "format": "mixed-precision",

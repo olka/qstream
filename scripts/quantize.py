@@ -129,7 +129,15 @@ def main():
     if missing:
         print(f"WARNING: {len(missing)} missing shards skipped: {missing[:3]}...")
 
-    input_format = detect_input_format(str(model_dir / existing[0]))
+    # Scan shards until a quantized format is found: the first shard may hold only
+    # dense/embedding BF16 tensors (e.g. Step-3.7), while the FP8/MXFP8 experts live
+    # in later shards. Default to fp16 only if no scale tensors exist anywhere.
+    input_format = "fp16"
+    for s in existing:
+        fmt = detect_input_format(str(model_dir / s))
+        if fmt != "fp16":
+            input_format = fmt
+            break
     print(f"Input format:     {input_format.upper()}")
     print(f"Quant format:     {args.quant_format.upper()}")
     print(f"Output format:    {args.output_format}")
@@ -383,9 +391,14 @@ def main():
         if k.endswith(".weight") and k[: -len(".weight")] not in fp8_modules_set
     )
 
-    if input_format == "mxfp8":
-        # Mixed precision: routed experts → MXFP4 (.weight_packed), every other FP8
-        # layer kept native MXFP8 (.weight + uint8 .weight_scale = fp8_modules).
+    used_mixed_builder = False
+    if input_format in ("mxfp8", "fp8") and any(
+        k.endswith(".weight_packed") for k in final_weight_map
+    ):
+        # Mixed precision: routed experts → MXFP4 (.weight_packed); every other FP8
+        # layer kept at native 8-bit (.weight + .weight_scale = fp8_modules).
+        # MXFP8 input keeps e8m0 group-32 FP8 (M3); plain FP8 input keeps block FP8
+        # (Step-3.7/DeepSeek, 128×128 float scales).
         mxfp4_modules = sorted(
             k[: -len(".weight_packed")]
             for k in final_weight_map
@@ -393,7 +406,7 @@ def main():
         )
         # Unquantized linears (router gate, lm_head, embeddings, vision, projector):
         # .weight with no scale companion. Exclude norms (not Linear).
-        mxfp8_ignore = sorted(
+        kept_ignore = sorted(
             k[: -len(".weight")]
             for k in final_weight_map
             if k.endswith(".weight")
@@ -401,8 +414,11 @@ def main():
             and "norm" not in k
         )
         config["quantization_config"] = build_quantization_config(
-            mxfp4_modules, fp8_modules, mxfp8_ignore
+            mxfp4_modules, fp8_modules, kept_ignore,
+            fp8_kind="mxfp8" if input_format == "mxfp8" else "block",
+            fp8_block_size=args.fp8_block_size,
         )
+        used_mixed_builder = True
     elif args.quant_format == "fp8":
         config["quantization_config"] = {
             "quant_method": "compressed-tensors",
@@ -442,7 +458,7 @@ def main():
             "ignore": ignore_modules,
         }
 
-    if input_format != "mxfp8" and fp8_modules and "config_groups" in config["quantization_config"]:
+    if not used_mixed_builder and fp8_modules and "config_groups" in config["quantization_config"]:
         sample_scale_key = fp8_modules[0] + ".weight_scale"
         sample_shard = output_dir / final_weight_map[sample_scale_key]
         with safe_open(str(sample_shard), framework="pt") as f:
