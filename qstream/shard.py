@@ -114,10 +114,18 @@ def should_quantize(key: str, exclude_patterns: list[str]) -> bool:
 
 
 def detect_input_format(shard_path: str) -> str:
-    """Return 'fp8' if the shard has weight_scale_inv keys, else 'fp16'."""
+    """Classify a shard's weight format from its scale tensors.
+
+    Returns:
+        'mxfp8' — has uint8 `weight_scale_inv` (OCP MXFP8 e8m0, block [1,32]; MiniMax-M3).
+        'fp8'   — has float `weight_scale_inv` (DeepSeek/Qwen block FP8, or per-tensor).
+        'fp16'  — no scale tensors (plain BF16/FP16).
+    """
     with safe_open(shard_path, framework="pt") as f:
         for k in f.keys():
             if k.endswith(".weight_scale_inv"):
+                if f.get_slice(k).get_dtype() == "U8":
+                    return "mxfp8"
                 return "fp8"
     return "fp16"
 
@@ -222,7 +230,7 @@ def process_shard(
         # Build weight → scale_inv and weight → activation_scale lookups for FP8 shards
         scale_inv_map: dict[str, str] = {}
         act_scale_map: dict[str, str] = {}
-        if input_format == "fp8":
+        if input_format in ("fp8", "mxfp8"):
             for k in keys:
                 if k.endswith(".weight_scale_inv"):
                     scale_inv_map[k.replace(".weight_scale_inv", ".weight")] = k
@@ -400,6 +408,19 @@ def process_shard(
                 if k in smoothed_norms:
                     # SmoothQuant: use the smoothed layernorm weights
                     output_tensors[k] = smoothed_norms[k]
+                elif input_format == "mxfp8" and t.dtype == torch.float8_e4m3fn:
+                    # MXFP8 passthrough: keep the fp8 weight and its uint8 e8m0 scale
+                    # bit-exact, renaming weight_scale_inv → weight_scale. The scale
+                    # MUST stay uint8 — vLLM's _is_mxfp8 requires scale_dtype == uint8.
+                    scale_key = scale_inv_map.get(k)
+                    if scale_key is not None:
+                        output_tensors[k] = t
+                        output_tensors[k.replace(".weight", ".weight_scale")] = (
+                            f.get_tensor(scale_key)
+                        )
+                        n_fp8_kept += 1
+                    else:
+                        output_tensors[k] = t.to(torch.bfloat16)
                 elif input_format == "fp8" and t.dtype == torch.float8_e4m3fn:
                     scale_key = scale_inv_map.get(k)
                     if scale_key is not None:

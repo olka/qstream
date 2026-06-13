@@ -40,6 +40,7 @@ _soft, _hard = resource.getrlimit(resource.RLIMIT_NOFILE)
 resource.setrlimit(resource.RLIMIT_NOFILE, (min(_hard, 65536), _hard))
 
 from qstream.gamma import load_layernorm_gammas
+from qstream.output import build_index_from_shards, build_quantization_config
 from qstream.shard import classify_shard, detect_input_format, process_shard
 
 
@@ -109,11 +110,17 @@ def main():
     output_dir.mkdir(parents=True, exist_ok=True)
 
     index_path = model_dir / "model.safetensors.index.json"
-    if not index_path.exists():
-        raise FileNotFoundError(f"Missing {index_path}")
-
-    with open(index_path) as f:
-        index = json.load(f)
+    if index_path.exists():
+        with open(index_path) as f:
+            index = json.load(f)
+    else:
+        # Some checkpoints (e.g. MiniMax-M3) ship without an index — reconstruct it
+        # from shard headers so the rest of the pipeline is unchanged.
+        all_shards = sorted(p.name for p in model_dir.glob("*.safetensors"))
+        if not all_shards:
+            raise FileNotFoundError(f"No index and no .safetensors shards in {model_dir}")
+        print(f"No index found — generating from {len(all_shards)} shard headers")
+        index = build_index_from_shards(str(model_dir), all_shards)
 
     weight_map = index["weight_map"]
     shard_files = sorted(set(weight_map.values()))
@@ -376,7 +383,27 @@ def main():
         if k.endswith(".weight") and k[: -len(".weight")] not in fp8_modules_set
     )
 
-    if args.quant_format == "fp8":
+    if input_format == "mxfp8":
+        # Mixed precision: routed experts → MXFP4 (.weight_packed), every other FP8
+        # layer kept native MXFP8 (.weight + uint8 .weight_scale = fp8_modules).
+        mxfp4_modules = sorted(
+            k[: -len(".weight_packed")]
+            for k in final_weight_map
+            if k.endswith(".weight_packed")
+        )
+        # Unquantized linears (router gate, lm_head, embeddings, vision, projector):
+        # .weight with no scale companion. Exclude norms (not Linear).
+        mxfp8_ignore = sorted(
+            k[: -len(".weight")]
+            for k in final_weight_map
+            if k.endswith(".weight")
+            and k[: -len(".weight")] not in fp8_modules_set
+            and "norm" not in k
+        )
+        config["quantization_config"] = build_quantization_config(
+            mxfp4_modules, fp8_modules, mxfp8_ignore
+        )
+    elif args.quant_format == "fp8":
         config["quantization_config"] = {
             "quant_method": "compressed-tensors",
             "format": "float-quantized",
@@ -415,7 +442,7 @@ def main():
             "ignore": ignore_modules,
         }
 
-    if fp8_modules and "config_groups" in config["quantization_config"]:
+    if input_format != "mxfp8" and fp8_modules and "config_groups" in config["quantization_config"]:
         sample_scale_key = fp8_modules[0] + ".weight_scale"
         sample_shard = output_dir / final_weight_map[sample_scale_key]
         with safe_open(str(sample_shard), framework="pt") as f:

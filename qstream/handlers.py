@@ -86,11 +86,12 @@ class StandardWeightHandler:
         scale_inv_map: dict[str, str],
         shard_file,
     ) -> torch.Tensor:
-        """Dequantize FP8 or cast to BF16, return tensor on device."""
-        if input_format == "fp8":
+        """Dequantize FP8/MXFP8 or cast to BF16, return tensor on device."""
+        if input_format in ("fp8", "mxfp8"):
             scale_key = scale_inv_map.get(key)
             if scale_key is None:
                 return tensor.to(device, torch.bfloat16)
+            # dequant_fp8_block auto-dispatches: uint8 scale → MXFP8 e8m0, else block FP8.
             return dequant_fp8_block(
                 tensor.to(device),
                 shard_file.get_tensor(scale_key).to(device),
@@ -138,8 +139,8 @@ class FusedExpertHandler:
         scale_inv_map: dict[str, str],
         shard_file,
     ) -> torch.Tensor:
-        """Dequant 3D FP8 (Step-3.7) or cast to BF16 (Qwen3.5)."""
-        if input_format == "fp8" and tensor.dtype == torch.float8_e4m3fn:
+        """Dequant 3D FP8/MXFP8 (Step-3.7) or cast to BF16 (Qwen3.5)."""
+        if input_format in ("fp8", "mxfp8") and tensor.dtype == torch.float8_e4m3fn:
             scale_key = scale_inv_map.get(key)
             if scale_key is not None:
                 return dequant_fp8_block(
