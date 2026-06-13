@@ -1,7 +1,7 @@
 """Quick perplexity of the served model via vLLM prompt_logprobs."""
-import sys, json, math, urllib.request
+import os, sys, json, math, urllib.request
 
-MODEL = "/root/.cache/huggingface/M3-MXFP4"
+MODEL = os.environ.get("EVAL_MODEL", "/root/.cache/huggingface/M3-MXFP4")
 TEXT = (
     "The quick brown fox jumps over the lazy dog. Machine learning models are "
     "trained on large datasets to predict the next token in a sequence. Quantization "
