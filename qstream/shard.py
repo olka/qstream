@@ -347,8 +347,19 @@ def process_shard(
                         packed, scales = quantize_mxfp4(weight_bf16, scale_percentile, gamma=g_dev)
 
                     if isinstance(handler, FusedExpertHandler) and output_format == "ct":
-                        # CT format: output per-expert separate tensors
-                        base = re.sub(r"\.(gate_up_proj|down_proj|gate_proj|up_proj)$", "", k)
+                        # CT format: output per-expert separate tensors.
+                        # Normalize base so emitted keys always live under `<prefix>.experts.{i}.`:
+                        #   - Qwen3.5: `<prefix>.experts.PROJ`        → base = `<prefix>.experts`
+                        #   - Step-3.7: `<prefix>.moe.PROJ.weight`    → base = `<prefix>.moe.experts`
+                        # That matches FusedMoE.make_expert_params_mapping's `experts.{E}.PROJ` wire
+                        # convention, which vLLM's CT MoE loader unpacks into the registered
+                        # `experts.w13_weight_packed` / `experts.w2_weight_packed` parameters.
+                        m = re.match(
+                            r"(.+?)\.(experts|moe)\.(gate_up_proj|down_proj|gate_proj|up_proj)(\.weight)?$",
+                            k,
+                        )
+                        prefix, container = m.group(1), m.group(2)
+                        base = f"{prefix}.experts" if container == "experts" else f"{prefix}.moe.experts"
                         n_experts = packed.shape[0]
 
                         if "gate_up_proj" in k:

@@ -87,7 +87,9 @@ def main():
     parser.add_argument("--format", choices=["fused", "ct"], default="ct",
                         dest="output_format",
                         help="Output format: 'ct' (compressed-tensors per-expert, stock vLLM) or "
-                             "'fused' (w13/w2, needs vLLM fork)")
+                             "'fused' (w13/w2 interleaved, needs vLLM fork). CT handles both "
+                             "Qwen3.5-style `.experts.PROJ` and Step-3.7-style `.moe.PROJ.weight` "
+                             "inputs, normalizing emitted keys to `.experts.{E}.PROJ.weight_packed`.")
     parser.add_argument("--expert_config", default=None,
                         help="Path to expert_errors.json from analyze_experts.py. "
                              "Enables selective per-expert quantization: low-error "

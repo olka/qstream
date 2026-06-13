@@ -16,9 +16,12 @@ import torch
 
 from .fp8 import dequant_fp8_block
 
-# Patterns that identify 3D fused expert tensors (no .weight suffix).
+# Patterns that identify 3D fused/stacked expert tensors.
+# Covers two layouts:
+#   - Qwen3.5: `...experts.{gate_up_proj|down_proj|...}`     (no .weight suffix)
+#   - Step-3.7: `...moe.{gate_proj|up_proj|down_proj}.weight` (with .weight suffix)
 _FUSED_EXPERT_PATTERNS = re.compile(
-    r"\.experts\.(gate_up_proj|down_proj|gate_proj|up_proj)$"
+    r"(\.experts|\.moe)\.(gate_up_proj|down_proj|gate_proj|up_proj)(\.weight)?$"
 )
 
 
@@ -106,14 +109,13 @@ class StandardWeightHandler:
 
 
 class FusedExpertHandler:
-    """Handles 3D fused expert tensors without .weight suffix.
+    """Handles 3D stacked expert tensors.
 
-    Covers: Qwen3.5-style stacked expert tensors like
-    experts.gate_up_proj [n_experts, out_dim, in_dim] and
-    experts.down_proj [n_experts, out_dim, in_dim].
+    Two source layouts supported:
+      - Qwen3.5: `...experts.{gate_up_proj|down_proj}` (no .weight, always BF16)
+      - Step-3.7: `...moe.{gate_proj|up_proj|down_proj}.weight` (FP8 with 128x128 blocks)
 
-    These are always BF16 (no FP8 variant exists yet).
-    quantize_mxfp4 handles 3D natively via *leading dims.
+    quantize_mxfp4 handles the 3D shape natively via *leading dims.
     """
 
     def should_quantize(
@@ -136,7 +138,15 @@ class FusedExpertHandler:
         scale_inv_map: dict[str, str],
         shard_file,
     ) -> torch.Tensor:
-        """Cast to BF16 on device. FP8 not supported for fused experts."""
+        """Dequant 3D FP8 (Step-3.7) or cast to BF16 (Qwen3.5)."""
+        if input_format == "fp8" and tensor.dtype == torch.float8_e4m3fn:
+            scale_key = scale_inv_map.get(key)
+            if scale_key is not None:
+                return dequant_fp8_block(
+                    tensor.to(device),
+                    shard_file.get_tensor(scale_key).to(device),
+                    fp8_block_size,
+                )
         return tensor.to(device, torch.bfloat16)
 
     @staticmethod
@@ -150,7 +160,11 @@ class FusedExpertHandler:
         return torch.stack([gate, up], dim=2).reshape(tensor.shape)
 
     def output_keys(self, key: str, quant_format: str = "mxfp4") -> tuple[str, str]:
-        """Return (weight_key, scale_key) using vLLM parameter names."""
+        """Return (weight_key, scale_key) for the fused vLLM-fork output format.
+
+        CT per-expert key construction is handled inline in process_shard since it
+        needs to fan out one input tensor into n_experts output tensors.
+        """
         if quant_format == "fp8":
             return (key, key + "_scale")
         if "gate_up_proj" in key:

@@ -218,6 +218,77 @@ class TestProcessShard:
             assert "model.layers.0.mlp.experts.w13_weight" in result
             assert "model.layers.0.mlp.experts.w13_weight_scale" in result
 
+    def test_quantizes_step_moe_ct(self):
+        """Step-3.7 layout: `.moe.gate_proj.weight` 3D FP8 → CT per-expert under `.moe.experts.{E}.`."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            input_path = os.path.join(tmpdir, "input.safetensors")
+            output_path = os.path.join(tmpdir, "output.safetensors")
+
+            E, out_f, in_f = 4, 256, 384
+            w = torch.ones(E, out_f, in_f, dtype=torch.float8_e4m3fn)
+            s = torch.full((E, 2, 3), 1.0, dtype=torch.float32)
+            save_file({
+                "model.layers.8.moe.gate_proj.weight": w,
+                "model.layers.8.moe.gate_proj.weight_scale_inv": s,
+                "model.layers.8.moe.down_proj.weight":
+                    torch.ones(E, in_f, out_f, dtype=torch.float8_e4m3fn),
+                "model.layers.8.moe.down_proj.weight_scale_inv":
+                    torch.full((E, 3, 2), 1.0, dtype=torch.float32),
+            }, input_path)
+
+            result = process_shard(
+                input_path, output_path,
+                exclude_patterns=[], input_format="fp8",
+                output_format="ct",
+            )
+
+            # CT per-expert keys with the inserted `.experts.` segment — matches
+            # what FusedMoE.make_expert_params_mapping expects.
+            for i in range(E):
+                assert f"model.layers.8.moe.experts.{i}.gate_proj.weight_packed" in result
+                assert f"model.layers.8.moe.experts.{i}.gate_proj.weight_scale" in result
+                assert f"model.layers.8.moe.experts.{i}.down_proj.weight_packed" in result
+                assert f"model.layers.8.moe.experts.{i}.down_proj.weight_scale" in result
+            assert "model.layers.8.moe.gate_proj.weight" not in result
+            assert "model.layers.8.moe.gate_proj.weight_scale_inv" not in result
+
+    def test_quantizes_qwen_experts_ct_unchanged(self):
+        """Qwen3.5-style `.experts.gate_up_proj` input must still emit `.experts.{E}.PROJ.weight_packed`."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            input_path = os.path.join(tmpdir, "input.safetensors")
+            output_path = os.path.join(tmpdir, "output.safetensors")
+
+            save_file({
+                "model.layers.0.mlp.experts.gate_up_proj":
+                    torch.randn(4, 64, 128, dtype=torch.bfloat16),
+            }, input_path)
+
+            result = process_shard(
+                input_path, output_path,
+                exclude_patterns=[], input_format="fp16",
+                output_format="ct",
+            )
+
+            for i in range(4):
+                assert f"model.layers.0.mlp.experts.{i}.gate_proj.weight_packed" in result
+                assert f"model.layers.0.mlp.experts.{i}.up_proj.weight_packed" in result
+            # Must not double-insert `.experts.experts.`
+            assert "model.layers.0.mlp.experts.experts.0.gate_proj.weight_packed" not in result
+
+    def test_classify_shard_step_moe(self):
+        """Step-3.7 `.moe.PROJ.weight` 3D keys must be picked up by classify_shard."""
+        from qstream.shard import classify_shard
+        with tempfile.NamedTemporaryFile(suffix=".safetensors", delete=False) as f:
+            save_file({
+                "model.layers.8.moe.gate_proj.weight": torch.randn(4, 64, 128).to(torch.float8_e4m3fn),
+                "model.layers.8.moe.gate_proj.weight_scale_inv": torch.ones(4, 1, 1, dtype=torch.float32),
+                "model.layers.8.moe.gate.weight": torch.randn(4, 64, dtype=torch.bfloat16),  # router 2D
+            }, f.name)
+            q, p = classify_shard(f.name, ["*moe.gate.weight"])
+            assert "model.layers.8.moe.gate_proj.weight" in q
+            assert "model.layers.8.moe.gate.weight" in p
+            os.unlink(f.name)
+
     def test_passthrough_excluded(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             input_path = os.path.join(tmpdir, "input.safetensors")

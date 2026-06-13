@@ -117,6 +117,50 @@ class TestFusedExpertHandler:
         assert packed_key == "model.layers.0.mlp.experts.w2_weight"
         assert scale_key == "model.layers.0.mlp.experts.w2_weight_scale"
 
+    def test_quantizes_step_moe_gate_proj(self):
+        """Step-3.7 layout: `.moe.gate_proj.weight` with 3D shape."""
+        t = torch.randn(4, 64, 128)
+        assert self.handler.should_quantize(
+            "model.layers.8.moe.gate_proj.weight", t, []
+        ) is True
+
+    def test_quantizes_step_moe_down_proj(self):
+        t = torch.randn(4, 128, 64)
+        assert self.handler.should_quantize(
+            "model.layers.8.moe.down_proj.weight", t, []
+        ) is True
+
+    def test_step_moe_skips_2d_router_gate(self):
+        """`.moe.gate.weight` (router) is 2D and must not match the fused pattern."""
+        t = torch.randn(288, 4096)
+        assert self.handler.should_quantize(
+            "model.layers.8.moe.gate.weight", t, []
+        ) is False
+
+    def test_prepare_weight_fp8_3d_dequant(self):
+        """3D FP8 input with 128x128 block scales should be dequanted to BF16."""
+        import tempfile, os
+        from safetensors.torch import save_file
+        from safetensors import safe_open
+
+        E, out_f, in_f = 2, 256, 256
+        w = torch.ones(E, out_f, in_f, dtype=torch.float8_e4m3fn)
+        s = torch.full((E, 2, 2), 1.5, dtype=torch.float32)
+        with tempfile.NamedTemporaryFile(suffix=".safetensors", delete=False) as f:
+            save_file({"k.weight": w, "k.weight_scale_inv": s}, f.name)
+            path = f.name
+        try:
+            with safe_open(path, framework="pt") as sf:
+                result = self.handler.prepare_weight(
+                    "k.weight", sf.get_tensor("k.weight"), "cpu", "fp8", 128,
+                    {"k.weight": "k.weight_scale_inv"}, sf,
+                )
+            assert result.dtype == torch.bfloat16
+            assert result.shape == (E, out_f, in_f)
+            assert (result.float() - 1.5).abs().max() < 0.05
+        finally:
+            os.unlink(path)
+
     def test_interleave_gate_up_roundtrip(self):
         # [E, 2*N, K] with first N=gate, last N=up
         E, N, K = 4, 8, 16
