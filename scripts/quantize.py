@@ -40,7 +40,7 @@ _soft, _hard = resource.getrlimit(resource.RLIMIT_NOFILE)
 resource.setrlimit(resource.RLIMIT_NOFILE, (min(_hard, 65536), _hard))
 
 from qstream.gamma import load_layernorm_gammas
-from qstream.output import build_index_from_shards, build_quantization_config
+from qstream.output import build_index_from_shards, build_quantization_config, compute_index_metadata
 from qstream.shard import classify_shard, detect_input_format, process_shard
 
 
@@ -377,9 +377,14 @@ def main():
             shutil.copy2(src, output_dir / src.name)
             print(f"Copied {src.name}")
 
-    # Write index from explicitly tracked mappings
+    # Write index from explicitly tracked mappings. Recompute metadata from the
+    # OUTPUT shards — never inherit the source index's metadata (its total_size is
+    # the original byte count and total_parameters describes the source, which would
+    # make HF report a wrong model size for the quantized checkpoint).
+    out_shards = sorted(set(final_weight_map.values()))
+    metadata = compute_index_metadata(str(output_dir), out_shards)
     with open(output_dir / "model.safetensors.index.json", "w") as f:
-        json.dump({"metadata": index.get("metadata", {}), "weight_map": final_weight_map}, f, indent=2)
+        json.dump({"metadata": metadata, "weight_map": final_weight_map}, f, indent=2)
     print(f"Index: {len(final_weight_map)} tensors across {len(set(final_weight_map.values()))} shards")
 
     config_path = output_dir / "config.json"

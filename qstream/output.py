@@ -34,6 +34,44 @@ def build_index_from_shards(model_dir: str, shard_files: list[str]) -> dict:
     return {"metadata": {"total_size": total_size}, "weight_map": weight_map}
 
 
+def compute_index_metadata(model_dir: str, shard_files: list[str]) -> dict:
+    """Compute correct index `metadata` for an OUTPUT directory from its shards.
+
+    The output's metadata must be recomputed, never inherited from the source
+    index — the source's `total_size` is the *original* (e.g. BF16) byte count and
+    its `total_parameters` (if present) describes the source, so copying them makes
+    HF report a wrong model size for the quantized checkpoint.
+
+    Returns:
+        total_size       — sum of stored tensor bytes (the actual on-disk weight size).
+        total_parameters — true model parameter count: uint8 MXFP4-`weight_packed`
+                           tensors hold two 4-bit codes per byte, so they count
+                           ``numel * 2``; ``*_scale`` / ``*_scale_inv`` tensors are
+                           quantization metadata and are excluded; everything else
+                           (BF16/FP8 weights, biases, SSM params) counts by ``numel``.
+    """
+    total_size = 0
+    total_parameters = 0
+    for shard in shard_files:
+        path = os.path.join(model_dir, shard)
+        with open(path, "rb") as f:
+            header_len = struct.unpack("<Q", f.read(8))[0]
+            header = json.loads(f.read(header_len))
+        for key, meta in header.items():
+            if key == "__metadata__":
+                continue
+            start, end = meta["data_offsets"]
+            total_size += end - start
+            if key.endswith("_scale") or key.endswith("_scale_inv"):
+                continue  # quantization scales, not model parameters
+            n = 1
+            for d in meta["shape"]:
+                n *= d
+            # uint8 weights are MXFP4-packed (two 4-bit codes per byte)
+            total_parameters += n * 2 if meta["dtype"] == "U8" else n
+    return {"total_size": total_size, "total_parameters": total_parameters}
+
+
 # --- quantization config -------------------------------------------------------
 
 _EXPERT_SEGMENT = re.compile(r"\.experts\.\d+\.")

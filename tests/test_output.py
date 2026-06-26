@@ -7,7 +7,7 @@ import tempfile
 import torch
 from safetensors.torch import save_file
 
-from qstream.output import build_index_from_shards, build_quantization_config
+from qstream.output import build_index_from_shards, build_quantization_config, compute_index_metadata
 
 
 def _re_match(targets, name):
@@ -34,6 +34,33 @@ class TestBuildIndexFromShards:
             assert wm["b.weight"] == "model-00001-of-00002.safetensors"
             assert wm["c.weight"] == "model-00002-of-00002.safetensors"
             assert "metadata" in idx and idx["metadata"]["total_size"] > 0
+
+
+class TestComputeIndexMetadata:
+    def test_packed_counts_two_params_per_byte_scales_excluded(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            shard = "model-00001-of-00001.safetensors"
+            save_file({
+                # MXFP4 expert: 64x32 uint8 packed = 2048 bytes -> 4096 true params
+                "layers.0.mlp.experts.0.down_proj.weight_packed": torch.zeros(64, 32, dtype=torch.uint8),
+                "layers.0.mlp.experts.0.down_proj.weight_scale":  torch.zeros(64, 2, dtype=torch.uint8),  # excluded
+                # BF16 passthrough weight: 16x8 = 128 params
+                "layers.0.self_attn.q_proj.weight": torch.zeros(16, 8, dtype=torch.bfloat16),
+                "layers.0.input_layernorm.weight": torch.zeros(16, dtype=torch.bfloat16),  # 16 params
+            }, os.path.join(tmp, shard))
+            md = compute_index_metadata(tmp, [shard])
+            # 64*32*2 (packed) + 16*8 (bf16) + 16 (norm) = 4096 + 128 + 16; scale excluded
+            assert md["total_parameters"] == 4096 + 128 + 16
+            assert md["total_size"] > 0  # actual on-disk bytes, not the source's
+
+    def test_does_not_inherit_source_metadata(self):
+        # total_size reflects the (small) output, never a stale large source value.
+        with tempfile.TemporaryDirectory() as tmp:
+            shard = "model-00001-of-00001.safetensors"
+            save_file({"a.weight": torch.zeros(4, 4, dtype=torch.bfloat16)}, os.path.join(tmp, shard))
+            md = compute_index_metadata(tmp, [shard])
+            assert md["total_parameters"] == 16
+            assert md["total_size"] == 4 * 4 * 2  # 16 bf16 elements * 2 bytes
 
 
 class TestBuildQuantizationConfig:
