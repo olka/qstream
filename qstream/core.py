@@ -1,8 +1,7 @@
-"""MXFP4 E2M1 quantization core.
+"""Quantization core: MXFP4 E2M1 and FP8 E4M3.
 
-Block size: 32 elements per scale (e8m0 biased exponent).
-Scale selection: MSE-optimal over {floor-1, floor, floor+1} candidate exponents.
-Activation-aware: optional γ-weighted MSE (γ = input_layernorm.weight).
+MXFP4: Block size 32, MSE-optimal scale selection, activation-aware γ-weighting.
+FP8:   Per-channel or per-tensor scales, simple amax-based.
 """
 
 import torch
@@ -207,3 +206,37 @@ def quantize_mxfp4(
     packed = codes_flat[..., 0::2] | (codes_flat[..., 1::2] << 4)
 
     return packed.to(torch.uint8), biased_exp
+
+
+# ---------------------------------------------------------------------------
+# FP8 E4M3 quantization
+# ---------------------------------------------------------------------------
+
+FP8_MAX = torch.finfo(torch.float8_e4m3fn).max  # 448.0
+
+
+def quantize_fp8(
+    tensor: torch.Tensor,
+    per_channel: bool = True,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Quantize a float tensor to FP8 E4M3 format.
+
+    Args:
+        tensor: Shape [out_features, in_features] (2D weight matrix).
+        per_channel: If True, compute one scale per output row (per-channel).
+                     If False, compute a single scalar scale (per-tensor).
+
+    Returns:
+        quantized: [out, in] float8_e4m3fn weights.
+        scale:     [out, 1] float32 per-channel scales, or [1, 1] per-tensor scale.
+                   Weight ≈ quantized * scale (dequantization).
+    """
+    t = tensor.float()
+    if per_channel:
+        amax = t.abs().amax(dim=-1, keepdim=True)  # [out, 1]
+    else:
+        amax = t.abs().amax().unsqueeze(0).unsqueeze(0)  # [1, 1]
+    scale = (amax / FP8_MAX).clamp(min=1e-12)
+    quantized = (t / scale).to(torch.float8_e4m3fn)
+    # Keep [out, 1] shape — vLLM's ChannelQuantScaleParameter expects it
+    return quantized, scale

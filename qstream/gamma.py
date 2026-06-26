@@ -22,8 +22,9 @@ def extract_layer_index(key: str) -> int | None:
     Works for keys like:
         model.layers.42.mlp.experts.0.gate_proj.weight
         transformer.layers.7.ffn.gate_proj.weight
+        model.transformer.blocks.3.self_attn.att_proj.weight  (MolmoAct)
     """
-    m = re.search(r'\.layers\.(\d+)\.', key)
+    m = re.search(r'\.(?:layers|blocks)\.(\d+)\.', key)
     return int(m.group(1)) if m else None
 
 
