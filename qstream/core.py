@@ -1,12 +1,20 @@
-"""Quantization core: MXFP4 E2M1 and FP8 E4M3.
+"""Quantization core: MXFP4 E2M1, NVFP4 E2M1, and FP8 E4M3.
 
-MXFP4: Block size 32, MSE-optimal scale selection, activation-aware γ-weighting.
+MXFP4: Block size 32, E8M0 power-of-2 scale, MSE-optimal scale selection,
+       activation-aware γ-weighting.
+NVFP4: Block size 16, two-level scaling — per-block E4M3 × per-tensor FP32 global,
+       amax-based (NVIDIA reference recipe).
 FP8:   Per-channel or per-tensor scales, simple amax-based.
 """
 
 import torch
 
 BLOCK_SIZE = 32
+
+# NVFP4: 16-element blocks, E4M3 block scale, per-tensor FP32 global scale.
+NVFP4_BLOCK_SIZE = 16
+FP4_E2M1_MAX = 6.0    # max representable E2M1 magnitude
+FP8_E4M3_MAX = 448.0  # max representable E4M3 magnitude (= torch.finfo(float8_e4m3fn).max)
 
 # MXFP4 E2M1 representable positive values: 0, 0.5, 1, 1.5, 2, 3, 4, 6
 # Boundaries are midpoints between consecutive values.
@@ -52,6 +60,25 @@ def _round_to_mxfp4(scaled: torch.Tensor) -> torch.Tensor:
     bucket = torch.searchsorted(_BOUNDARIES.to(scaled.device), abs_scaled.reshape(-1))
     dequant_abs = _POS_VALUES.to(scaled.device)[bucket].reshape_as(abs_scaled)
     return dequant_abs * scaled.sign()
+
+
+def _pack_e2m1(scaled: torch.Tensor, leading, K: int) -> torch.Tensor:
+    """Round scaled values in [-6, 6] to E2M1 codes and pack two nibbles per byte.
+
+    Shared by MXFP4 and NVFP4 — only the scale differs, the element encoding does not.
+
+    Args:
+        scaled:  [*leading, num_blocks, block_size] values already divided by scale.
+        leading: the leading dims (everything before the block axes).
+        K:       num_blocks * block_size (the un-blocked trailing size).
+    Returns:
+        [*leading, K//2] uint8 — codes interleaved as (lo | hi << 4).
+    """
+    abs_s = scaled.abs().clamp(max=6.0)
+    bucket = torch.searchsorted(_BOUNDARIES.to(scaled.device), abs_s.reshape(-1))
+    sign_mask = (scaled.reshape(-1) < 0).to(torch.uint8) * 8
+    codes = (bucket.to(torch.uint8) + sign_mask).reshape(*leading, K)
+    return (codes[..., 0::2] | (codes[..., 1::2] << 4)).to(torch.uint8)
 
 
 def dequant_mxfp4(
@@ -197,15 +224,119 @@ def quantize_mxfp4(
     actual_scale = torch.pow(2.0, raw_exp)
 
     scaled_final = (t_blocked / actual_scale.unsqueeze(-1)).clamp(-6.0, 6.0)
-    abs_final = scaled_final.abs().clamp(max=6.0)
-    bucket = torch.searchsorted(_BOUNDARIES.to(t.device), abs_final.reshape(-1))
-    sign_mask = (scaled_final.reshape(-1) < 0).to(torch.uint8) * 8
-    codes = (bucket.to(torch.uint8) + sign_mask).reshape(*leading, num_blocks, BLOCK_SIZE)
+    packed = _pack_e2m1(scaled_final, leading, K)
 
-    codes_flat = codes.reshape(*leading, K)
-    packed = codes_flat[..., 0::2] | (codes_flat[..., 1::2] << 4)
+    return packed, biased_exp
 
-    return packed.to(torch.uint8), biased_exp
+
+# ---------------------------------------------------------------------------
+# NVFP4 E2M1 quantization (compressed-tensors nvfp4-pack-quantized)
+# ---------------------------------------------------------------------------
+
+
+def _nvfp4_block_scale(
+    block_amax: torch.Tensor, global_scale_b: torch.Tensor
+) -> torch.Tensor:
+    """Per-block E4M3 scale from block amax and the per-tensor global scale.
+
+    Reference recipe (vLLM ``ref_nvfp4_quant``): ``scale = global · amax / 6``,
+    clamped to the E4M3 range and cast to ``float8_e4m3fn``. v1 is amax-based; a
+    continuous / γ-weighted block-scale search would replace this helper without
+    touching any caller.
+
+    Args:
+        block_amax:     [..., num_blocks] per-block max abs value.
+        global_scale_b: broadcastable to block_amax (per-tensor global scale).
+    Returns:
+        float8_e4m3fn block scales, same shape as block_amax.
+    """
+    scale = global_scale_b * (block_amax / FP4_E2M1_MAX)
+    scale = scale.clamp(min=-FP8_E4M3_MAX, max=FP8_E4M3_MAX)
+    return scale.to(torch.float8_e4m3fn)
+
+
+def quantize_nvfp4(
+    tensor: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Quantize a float tensor to NVFP4 (compressed-tensors ``nvfp4-pack-quantized``).
+
+    Two-level scaling: a per-tensor FP32 global scale and a per-16-block E4M3 scale.
+    The global scale is stored in the **CT reciprocal convention** ``(6·448)/amax``;
+    vLLM applies ``1/x`` on load. Amax-based (NVIDIA reference recipe) — ``gamma`` is
+    intentionally unused at this layer (see _nvfp4_block_scale for the extension point).
+
+    Args:
+        tensor: Shape [..., out, in] — 2D, or 3D batched over experts. Last dim
+                divisible by NVFP4_BLOCK_SIZE (16). The global scale is reduced over
+                ``(out, in)`` per leading "expert" index: one scalar for a 2D weight,
+                one per expert for a 3D [E, out, in] weight.
+
+    Returns:
+        packed:       [..., out, in//2] uint8 — two E2M1 codes per byte.
+        block_scale:  [..., out, in//16] float8_e4m3fn — per-block scales.
+        global_scale: [..., 1] float32 — per-tensor global, stored as (6·448)/amax
+                      (2D → shape [1]; 3D → shape [E, 1], one per expert).
+    """
+    assert tensor.shape[-1] % NVFP4_BLOCK_SIZE == 0, (
+        f"Last dim {tensor.shape[-1]} not divisible by NVFP4_BLOCK_SIZE={NVFP4_BLOCK_SIZE}"
+    )
+    assert tensor.ndim >= 2, f"Expected 2D or 3D tensor, got {tensor.ndim}D"
+
+    t = tensor.to(torch.float32)
+    *batch, OUT, K = t.shape
+    num_blocks = K // NVFP4_BLOCK_SIZE
+
+    # Per-tensor (per-expert) global scale: amax over (out, in). Stored as 2688/amax
+    # (CT reciprocal convention). Shape [*batch, 1] so a 2D weight yields [1] and a
+    # 3D weight yields [E, 1] — exactly one scalar per emitted logical weight.
+    amax = t.abs().amax(dim=(-2, -1)).clamp(min=1e-12)               # [*batch]
+    global_scale = ((FP4_E2M1_MAX * FP8_E4M3_MAX) / amax).reshape(*batch, 1)
+
+    t_blocked = t.reshape(*batch, OUT, num_blocks, NVFP4_BLOCK_SIZE)
+    block_amax = t_blocked.abs().amax(dim=-1)                        # [*batch, OUT, nb]
+    near_zero = block_amax < 1e-12
+
+    gs_block = global_scale.reshape(*batch, 1, 1)                    # broadcast over OUT, nb
+    block_scale = _nvfp4_block_scale(block_amax, gs_block)          # e4m3 [*batch, OUT, nb]
+
+    bs_f32 = block_scale.to(torch.float32)
+    safe_bs = torch.where(bs_f32 == 0, torch.ones_like(bs_f32), bs_f32)
+    output_scale = gs_block / safe_bs                               # [*batch, OUT, nb]
+    scaled = (t_blocked * output_scale.unsqueeze(-1)).clamp(-FP4_E2M1_MAX, FP4_E2M1_MAX)
+    scaled = torch.where(near_zero.unsqueeze(-1), torch.zeros_like(scaled), scaled)
+
+    packed = _pack_e2m1(scaled, (*batch, OUT), K)
+    return packed, block_scale, global_scale.to(torch.float32)
+
+
+def dequant_nvfp4(
+    packed: torch.Tensor,
+    block_scale: torch.Tensor,
+    global_scale: torch.Tensor,
+    shape: tuple[int, ...],
+) -> torch.Tensor:
+    """Dequantize NVFP4 packed weights back to float32.
+
+    Reconstruction: ``e2m1(code) · block_scale / global_scale`` (global stored as
+    2688/amax, so we divide). Mirrors vLLM's ``dequantize_to_dtype`` with
+    ``weight_global_scale = 1/global`` applied on load.
+
+    Args:
+        packed:       [..., out, in//2] uint8 — two 4-bit codes per byte.
+        block_scale:  [..., out, in//16] float8_e4m3fn — per-block scales.
+        global_scale: [..., 1] float32 — per-tensor global (2688/amax).
+        shape:        Original weight shape (e.g. [out, in] or [E, out, in]).
+    """
+    lo = packed & 0x0F
+    hi = (packed >> 4) & 0x0F
+    codes = torch.stack([lo, hi], dim=-1).reshape(shape)
+    sign = ((codes >> 3) & 1).float() * -2 + 1
+    mag_idx = (codes & 0x07).long().reshape(-1)
+    magnitude = _POS_VALUES.to(packed.device)[mag_idx].reshape(codes.shape)
+
+    bs_expanded = block_scale.to(torch.float32).repeat_interleave(NVFP4_BLOCK_SIZE, dim=-1)
+    gs = global_scale.to(torch.float32).reshape(*global_scale.shape[:-1], 1, 1)
+    return sign * magnitude * bs_expanded / gs
 
 
 # ---------------------------------------------------------------------------

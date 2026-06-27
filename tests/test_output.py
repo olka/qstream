@@ -96,6 +96,27 @@ class TestBuildQuantizationConfig:
         assert _re_match(g["targets"], f"{L}.self_attn.qkv_proj")
         assert _re_match(g["targets"], f"{L}.mlp.gate_up_proj")
 
+    def test_nvfp4_group_schema(self):
+        """fp4_kind='nvfp4' → group_0 is nvfp4-pack-quantized, group_size 16,
+        strategy tensor_group (what vLLM's _is_nvfp4_format requires)."""
+        L = "model.layers.7"
+        c = build_quantization_config(
+            mxfp4_modules=[f"{L}.moe.experts.0.gate_proj"],
+            fp8_modules=[f"{L}.self_attn.q_proj"],
+            ignore_modules=["lm_head"],
+            fp4_kind="nvfp4",
+        )
+        g = c["config_groups"]["group_0"]
+        assert g["format"] == "nvfp4-pack-quantized"
+        w = g["weights"]
+        assert w["num_bits"] == 4
+        assert w["type"] == "float"
+        assert w["strategy"] == "tensor_group"
+        assert w["group_size"] == 16
+        assert w["symmetric"] is True
+        # expert/merged targeting is identical to mxfp4 (layout, not encoding)
+        assert _re_match(g["targets"], f"{L}.moe.experts.0.down_proj")
+
     def test_mxfp8_group_schema(self):
         g = self._cfg()["config_groups"]["group_1"]
         assert g["format"] == "mxfp8-quantized"

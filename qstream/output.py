@@ -128,13 +128,17 @@ def build_quantization_config(
     fp8_modules: list[str],
     ignore_modules: list[str],
     *,
+    fp4_kind: str = "mxfp4",
     fp8_kind: str = "mxfp8",
     fp8_block_size: int = 128,
 ) -> dict:
     """Assemble a compressed-tensors mixed-precision quantization config.
 
     Two config groups are emitted:
-      group_0 — MXFP4 (num_bits 4, group_size 32) for the routed experts.
+      group_0 — packed FP4 (num_bits 4) for the routed experts. `fp4_kind` selects MXFP4
+                (group_size 32, E8M0 scales) or NVFP4 (group_size 16, tensor_group, E4M3
+                block scales + per-tensor global). The group's `format` + `weights` block
+                come from the QuantScheme (single source of truth).
       group_1 — FP8 (num_bits 8) for the layers kept at native precision (attention,
                 dense MLP, shared experts). `fp8_kind` selects MXFP8 (M3, e8m0) or
                 block FP8 (Step-3.7/DeepSeek, 128×128 float scales).
@@ -144,18 +148,16 @@ def build_quantization_config(
     unquantized. The two groups are disjoint; `ignore` covers everything left
     unquantized (router gate, lm_head, embeddings, vision tower, projector).
     """
+    # Imported here to avoid a module-load cycle (schemes -> core; output is pure).
+    from .schemes import get_scheme
+
     config_groups: dict[str, dict] = {}
     if mxfp4_modules:
+        fp4_format, fp4_weights = get_scheme(fp4_kind).weights_descriptor()
         config_groups["group_0"] = {
             "targets": _dedup(_mxfp4_targets(mxfp4_modules) + _merged_targets(mxfp4_modules)),
-            "format": "mxfp4-pack-quantized",
-            "weights": {
-                "num_bits": 4,
-                "type": "float",
-                "strategy": "group",
-                "group_size": 32,
-                "symmetric": True,
-            },
+            "format": fp4_format,
+            "weights": fp4_weights,
         }
     if fp8_modules:
         config_groups["group_1"] = _fp8_group(fp8_modules, fp8_kind, fp8_block_size)

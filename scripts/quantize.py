@@ -41,6 +41,7 @@ resource.setrlimit(resource.RLIMIT_NOFILE, (min(_hard, 65536), _hard))
 
 from qstream.gamma import load_layernorm_gammas
 from qstream.output import build_index_from_shards, build_quantization_config
+from qstream.schemes import get_scheme
 from qstream.shard import classify_shard, detect_input_format, process_shard
 
 
@@ -49,8 +50,9 @@ def main():
     parser.add_argument("--model_dir", required=True)
     parser.add_argument("--output_dir", required=True)
     parser.add_argument(
-        "--quant_format", choices=["mxfp4", "fp8"], default="mxfp4",
-        help="Quantization format: mxfp4 (4-bit, default) or fp8 (8-bit per-channel)",
+        "--quant_format", choices=["mxfp4", "nvfp4", "fp8"], default="mxfp4",
+        help="Quantization format: mxfp4 (4-bit, default), nvfp4 (4-bit, 16-block "
+             "two-level scaling), or fp8 (8-bit per-channel)",
     )
     parser.add_argument(
         "--exclude_layers",
@@ -160,6 +162,8 @@ def main():
         print(f"Exclude patterns: {args.exclude_layers}")
     if args.quant_format == "mxfp4":
         print(f"MSE scale select: enabled (3 candidates per block)")
+    elif args.quant_format == "nvfp4":
+        print(f"NVFP4 scale:      amax-based, group_size 16 (E4M3 block × FP32 global)")
     else:
         print(f"FP8 scale:        per-channel (amax / FP8_MAX)")
 
@@ -423,6 +427,7 @@ def main():
         )
         config["quantization_config"] = build_quantization_config(
             mxfp4_modules, fp8_modules, kept_ignore,
+            fp4_kind=args.quant_format,
             fp8_kind="mxfp8" if input_format == "mxfp8" else "block",
             fp8_block_size=args.fp8_block_size,
         )
@@ -448,19 +453,14 @@ def main():
     elif any("w13_weight" in k for k in final_weight_map) and args.output_format == "fused":
         config["quantization_config"] = {"quant_method": "mxfp4"}
     else:
+        fp4_format, fp4_weights = get_scheme(args.quant_format).weights_descriptor()
         config["quantization_config"] = {
             "quant_method": "compressed-tensors",
-            "format": "mxfp4-pack-quantized",
+            "format": fp4_format,
             "config_groups": {
                 "group_0": {
                     "targets": ["Linear"],
-                    "weights": {
-                        "num_bits": 4,
-                        "type": "float",
-                        "strategy": "group",
-                        "group_size": 32,
-                        "symmetric": True,
-                    },
+                    "weights": fp4_weights,
                 }
             },
             "ignore": ignore_modules,

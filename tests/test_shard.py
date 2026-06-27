@@ -4,6 +4,7 @@ import json
 import os
 import tempfile
 
+import pytest
 import torch
 from safetensors import safe_open
 from safetensors.torch import save_file
@@ -169,6 +170,81 @@ class TestProcessShard:
             assert "model.layers.0.mlp.up_proj.weight_scale" in result
             assert "model.layers.0.input_layernorm.weight" in result
             assert os.path.exists(output_path)
+
+    def test_quantizes_bf16_shard_nvfp4(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            input_path = os.path.join(tmpdir, "input.safetensors")
+            output_path = os.path.join(tmpdir, "output.safetensors")
+
+            save_file({
+                "model.layers.0.mlp.up_proj.weight": torch.randn(64, 128, dtype=torch.bfloat16),
+            }, input_path)
+
+            result = process_shard(
+                input_path, output_path,
+                exclude_patterns=[], input_format="fp16", quant_format="nvfp4",
+            )
+
+            base = "model.layers.0.mlp.up_proj"
+            assert f"{base}.weight_packed" in result
+            assert f"{base}.weight_scale" in result
+            assert f"{base}.weight_global_scale" in result   # the extra nvfp4 tensor
+
+            with safe_open(output_path, framework="pt") as f:
+                assert f.get_slice(f"{base}.weight_scale").get_dtype() == "F8_E4M3"
+                gs = f.get_tensor(f"{base}.weight_global_scale")
+                assert gs.dtype == torch.float32 and gs.numel() == 1
+                packed = f.get_tensor(f"{base}.weight_packed")
+                assert packed.dtype == torch.uint8 and packed.shape == (64, 64)
+                scale = f.get_tensor(f"{base}.weight_scale")
+                assert scale.shape == (64, 128 // 16)         # group_size 16
+
+    def test_quantizes_experts_nvfp4_separate_globals(self):
+        """NVFP4 CT experts emit per-expert gate/up with *independent* global scales."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            input_path = os.path.join(tmpdir, "input.safetensors")
+            output_path = os.path.join(tmpdir, "output.safetensors")
+
+            save_file({
+                "model.layers.0.mlp.experts.gate_up_proj":
+                    torch.randn(4, 64, 128, dtype=torch.bfloat16),
+            }, input_path)
+
+            result = process_shard(
+                input_path, output_path,
+                exclude_patterns=[], input_format="fp16",
+                quant_format="nvfp4", output_format="ct",
+            )
+
+            for i in range(4):
+                for proj in ("gate_proj", "up_proj"):
+                    b = f"model.layers.0.mlp.experts.{i}.{proj}"
+                    assert f"{b}.weight_packed" in result
+                    assert f"{b}.weight_scale" in result
+                    assert f"{b}.weight_global_scale" in result
+
+            with safe_open(output_path, framework="pt") as f:
+                g0 = f.get_tensor("model.layers.0.mlp.experts.0.gate_proj.weight_global_scale")
+                u0 = f.get_tensor("model.layers.0.mlp.experts.0.up_proj.weight_global_scale")
+                assert g0.shape == (1,) and u0.shape == (1,)
+                # gate and up are quantized from independent row-halves: their per-tensor
+                # amax (hence global scale) generally differ — proving split-before-quantize.
+                assert not torch.equal(g0, u0)
+
+    def test_nvfp4_fused_output_raises(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            input_path = os.path.join(tmpdir, "input.safetensors")
+            output_path = os.path.join(tmpdir, "output.safetensors")
+            save_file({
+                "model.layers.0.mlp.experts.gate_up_proj":
+                    torch.randn(4, 64, 128, dtype=torch.bfloat16),
+            }, input_path)
+            with pytest.raises(ValueError, match="NVFP4.*fused"):
+                process_shard(
+                    input_path, output_path,
+                    exclude_patterns=[], input_format="fp16",
+                    quant_format="nvfp4", output_format="fused",
+                )
 
     def test_quantizes_3d_fused_experts_ct(self):
         with tempfile.TemporaryDirectory() as tmpdir:

@@ -3,7 +3,15 @@
 import torch
 import pytest
 
-from qstream.core import BLOCK_SIZE, _POS_VALUES, quantize_mxfp4, _round_to_mxfp4
+from qstream.core import (
+    BLOCK_SIZE,
+    NVFP4_BLOCK_SIZE,
+    _POS_VALUES,
+    _round_to_mxfp4,
+    dequant_nvfp4,
+    quantize_mxfp4,
+    quantize_nvfp4,
+)
 
 
 class TestRoundToMxfp4:
@@ -110,3 +118,89 @@ class TestQuantizeMxfp4:
         t = torch.randn(32, 64, dtype=torch.bfloat16)
         _, scales = quantize_mxfp4(t)
         assert (scales <= 254).all()
+
+
+class TestQuantizeNvfp4:
+    def test_basic_2d(self):
+        t = torch.randn(64, 128, dtype=torch.bfloat16)
+        packed, block_scale, global_scale = quantize_nvfp4(t)
+        assert packed.shape == (64, 64)                       # 128 / 2
+        assert packed.dtype == torch.uint8
+        assert block_scale.shape == (64, 128 // NVFP4_BLOCK_SIZE)  # group_size 16
+        assert block_scale.dtype == torch.float8_e4m3fn
+        assert global_scale.shape == (1,)                     # per-tensor scalar
+        assert global_scale.dtype == torch.float32
+
+    def test_3d_fused_experts(self):
+        n_experts, out_dim, in_dim = 4, 32, 64
+        t = torch.randn(n_experts, out_dim, in_dim, dtype=torch.bfloat16)
+        packed, block_scale, global_scale = quantize_nvfp4(t)
+        assert packed.shape == (n_experts, out_dim, in_dim // 2)
+        assert block_scale.shape == (n_experts, out_dim, in_dim // NVFP4_BLOCK_SIZE)
+        assert global_scale.shape == (n_experts, 1)           # one global per expert
+
+    def test_last_dim_not_divisible_raises(self):
+        t = torch.randn(64, 20)  # 20 % 16 != 0
+        with pytest.raises(AssertionError, match="not divisible"):
+            quantize_nvfp4(t)
+
+    def test_global_scale_recipe(self):
+        """Global scale is stored as (6·448)/amax (CT reciprocal convention)."""
+        torch.manual_seed(0)
+        t = torch.randn(32, 64, dtype=torch.float32)
+        _, _, global_scale = quantize_nvfp4(t)
+        expected = (6.0 * 448.0) / t.abs().amax()
+        torch.testing.assert_close(global_scale.squeeze(), expected, rtol=1e-5, atol=0)
+
+    def test_dequant_reconstruction_quality(self):
+        """16-elem blocks + E4M3 scales should reconstruct within MSE < 2% of variance."""
+        torch.manual_seed(42)
+        t = torch.randn(256, 256, dtype=torch.float32)
+        packed, block_scale, global_scale = quantize_nvfp4(t)
+        rec = dequant_nvfp4(packed, block_scale, global_scale, t.shape)
+        mse = ((t - rec) ** 2).mean()
+        assert mse / t.var() < 0.02, f"MSE/var = {mse / t.var():.4f}, expected < 0.02"
+
+    def test_dequant_roundtrip_3d(self):
+        torch.manual_seed(1)
+        t = torch.randn(4, 32, 64, dtype=torch.float32)
+        packed, block_scale, global_scale = quantize_nvfp4(t)
+        rec = dequant_nvfp4(packed, block_scale, global_scale, t.shape)
+        assert rec.shape == t.shape
+        assert ((t - rec) ** 2).mean() / t.var() < 0.02
+
+    def test_zero_tensor(self):
+        t = torch.zeros(32, 64, dtype=torch.bfloat16)
+        packed, block_scale, _ = quantize_nvfp4(t)
+        assert (packed == 0).all()
+
+    def test_packed_code_range(self):
+        t = torch.randn(32, 64, dtype=torch.bfloat16)
+        packed, _, _ = quantize_nvfp4(t)
+        assert (packed & 0x0F <= 15).all()
+        assert ((packed >> 4) & 0x0F <= 15).all()
+
+
+# Optional cross-check against vLLM's NVFP4 reference dequant — the strongest
+# correctness gate. Skipped when vLLM is not importable.
+try:
+    from vllm.model_executor.layers.quantization.utils.nvfp4_emulation_utils import (
+        dequantize_to_dtype as _vllm_dequant_nvfp4,
+    )
+    _HAS_VLLM = True
+except Exception:
+    _HAS_VLLM = False
+
+
+@pytest.mark.skipif(not _HAS_VLLM, reason="vLLM not importable")
+def test_nvfp4_matches_vllm_reference():
+    torch.manual_seed(7)
+    t = torch.randn(64, 128, dtype=torch.float32)
+    packed, block_scale, global_scale = quantize_nvfp4(t)
+    ours = dequant_nvfp4(packed, block_scale, global_scale, t.shape)
+    # vLLM applies `1/x` to the stored global on load (CT convention), so pass 1/global.
+    theirs = _vllm_dequant_nvfp4(
+        packed, block_scale, (1.0 / global_scale).reshape(()),
+        torch.float32, block_size=NVFP4_BLOCK_SIZE, swizzle=False,
+    )
+    torch.testing.assert_close(ours, theirs, rtol=1e-3, atol=1e-3)

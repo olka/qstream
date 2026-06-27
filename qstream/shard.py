@@ -11,10 +11,16 @@ import torch
 from safetensors import safe_open
 from safetensors.torch import save_file
 
-_libc = ctypes.CDLL("libc.so.6")
+# glibc malloc_trim() releases freed arenas back to the OS between shards (Linux).
+# Not available on macOS (no libc.so.6 / no malloc_trim) — degrade to a no-op there.
+try:
+    _libc = ctypes.CDLL("libc.so.6")
+    _malloc_trim = _libc.malloc_trim
+except (OSError, AttributeError):
+    _malloc_trim = None
 
 from .calibrate import load_calibration_stats
-from .core import BLOCK_SIZE, quantize_fp8, quantize_mxfp4
+from .core import BLOCK_SIZE, quantize_fp8
 from .gamma import extract_expert_index, extract_layer_index
 from .handlers import (
     FusedExpertHandler,
@@ -23,6 +29,25 @@ from .handlers import (
     get_handler,
     should_quantize_key,
 )
+from .schemes import get_scheme
+
+
+def _scheme_quantize(scheme, weight, gamma, scale_percentile):
+    """Quantize a 2D weight, or a 3D [E, out, in] expert stack, with the named-scale
+    contract of QuantScheme.quantize.
+
+    3D is looped per-expert (not batched) to bound peak memory — the MSE candidate
+    tensors are large — and, for NVFP4, this yields the correct per-expert global scale.
+    The expert dim is preserved in every returned tensor (stacked), so callers index
+    ``t[i]`` uniformly across suffixes.
+    """
+    if weight.ndim == 3:
+        per = [
+            scheme.quantize(weight[i], gamma=gamma, scale_percentile=scale_percentile)
+            for i in range(weight.shape[0])
+        ]
+        return {suffix: torch.stack([p[suffix] for p in per]) for suffix in per[0]}
+    return scheme.quantize(weight, gamma=gamma, scale_percentile=scale_percentile)
 
 
 def _normalize_fp8_scale(scale: torch.Tensor) -> torch.Tensor:
@@ -213,6 +238,15 @@ def process_shard(
     torch.set_num_threads(threads_per_worker)
     shard_name = os.path.basename(input_path)
 
+    # Packed-FP4 formats (mxfp4/nvfp4) are handled by a QuantScheme; fp8 stays a
+    # special case below. The scheme owns encoding, the named scale set, and group size.
+    scheme = get_scheme(quant_format) if quant_format != "fp8" else None
+    if quant_format == "nvfp4" and output_format == "fused":
+        raise ValueError(
+            "NVFP4 with output_format='fused' is not supported; use output_format='ct' "
+            "(the compressed-tensors per-expert layout)."
+        )
+
     # Load calibration stats inside the worker — avoids cross-process tensor fd sharing.
     activation_stats = None
     if calibration_stats_path:
@@ -279,11 +313,12 @@ def process_shard(
                     k, t, device, input_format, fp8_block_size, scale_inv_map, f,
                 )
 
+                align = scheme.group_size if scheme is not None else BLOCK_SIZE
                 in_features = weight_bf16.shape[-1]
-                if in_features % BLOCK_SIZE != 0:
-                    pad = BLOCK_SIZE - (in_features % BLOCK_SIZE)
+                if in_features % align != 0:
+                    pad = align - (in_features % align)
                     weight_bf16 = torch.nn.functional.pad(weight_bf16, (0, pad))
-                    print(f"  WARNING: Padded {k} by {pad} for BLOCK_SIZE alignment")
+                    print(f"  WARNING: Padded {k} by {pad} for block alignment ({align})")
 
                 # Resolve γ: activation_stats takes priority over gamma_by_layer.
                 # γ is used only for MSE weighting; block_max always uses unweighted
@@ -341,67 +376,65 @@ def process_shard(
                     output_tensors[scale_key] = q_scales.cpu()
                     n_quantized += 1
                 else:
-                    # MXFP4 quantization
-                    if weight_bf16.ndim == 3:
-                        packed_list, scales_list = [], []
-                        for i in range(weight_bf16.shape[0]):
-                            p, s = quantize_mxfp4(weight_bf16[i], scale_percentile, gamma=g_dev)
-                            packed_list.append(p.cpu())
-                            scales_list.append(s.cpu())
-                        packed = torch.stack(packed_list)
-                        scales = torch.stack(scales_list)
-                        del packed_list, scales_list
-                    else:
-                        packed, scales = quantize_mxfp4(weight_bf16, scale_percentile, gamma=g_dev)
-
+                    # Packed-FP4 (mxfp4 / nvfp4) via QuantScheme. The scheme returns a
+                    # {suffix: tensor} dict (e.g. weight_packed/weight_scale, plus
+                    # weight_global_scale for nvfp4); shard.py only routes the named
+                    # tensors to keys — it never branches on the format.
                     if isinstance(handler, FusedExpertHandler) and output_format == "ct":
-                        # CT format: output per-expert separate tensors.
-                        # Normalize base so emitted keys always live under `<prefix>.experts.{i}.`:
-                        #   - Qwen3.5: `<prefix>.experts.PROJ`        → base = `<prefix>.experts`
-                        #   - Step-3.7: `<prefix>.moe.PROJ.weight`    → base = `<prefix>.moe.experts`
-                        # That matches FusedMoE.make_expert_params_mapping's `experts.{E}.PROJ` wire
-                        # convention, which vLLM's CT MoE loader unpacks into the registered
-                        # `experts.w13_weight_packed` / `experts.w2_weight_packed` parameters.
+                        # CT format: per-expert separate tensors. Keys live under
+                        # `<prefix>.experts.{i}.PROJ.<suffix>`, matching vLLM's
+                        # make_expert_params_mapping (assembled into w13_/w2_ params).
+                        #
+                        # Split gate/up into halves BEFORE quantizing: NVFP4's per-tensor
+                        # global scale must be per emitted weight (gate and up get
+                        # separate globals — vLLM's w13_weight_global_scale is [E, 2]).
+                        # For MXFP4 (per-block scales, independent rows) splitting first is
+                        # bit-identical to quantizing the fused blob and slicing.
                         m = re.match(
                             r"(.+?)\.(experts|moe)\.(gate_up_proj|down_proj|gate_proj|up_proj)(\.weight)?$",
                             k,
                         )
                         prefix, container = m.group(1), m.group(2)
                         base = f"{prefix}.experts" if container == "experts" else f"{prefix}.moe.experts"
-                        n_experts = packed.shape[0]
 
                         if "gate_up_proj" in k:
-                            N = packed.shape[1] // 2
-                            for i in range(n_experts):
-                                gate_p = packed[i, :N, :].cpu()
-                                gate_s = scales[i, :N, :].cpu()
-                                up_p = packed[i, N:, :].cpu()
-                                up_s = scales[i, N:, :].cpu()
-                                output_tensors[f"{base}.{i}.gate_proj.weight_packed"] = gate_p
-                                output_tensors[f"{base}.{i}.gate_proj.weight_scale"] = gate_s
-                                output_tensors[f"{base}.{i}.up_proj.weight_packed"] = up_p
-                                output_tensors[f"{base}.{i}.up_proj.weight_scale"] = up_s
+                            half = weight_bf16.shape[1] // 2
+                            parts = [
+                                ("gate_proj", weight_bf16[:, :half, :]),
+                                ("up_proj", weight_bf16[:, half:, :]),
+                            ]
                         elif "down_proj" in k:
-                            for i in range(n_experts):
-                                output_tensors[f"{base}.{i}.down_proj.weight_packed"] = packed[i].cpu()
-                                output_tensors[f"{base}.{i}.down_proj.weight_scale"] = scales[i].cpu()
+                            parts = [("down_proj", weight_bf16)]
                         elif "gate_proj" in k:
-                            for i in range(n_experts):
-                                output_tensors[f"{base}.{i}.gate_proj.weight_packed"] = packed[i].cpu()
-                                output_tensors[f"{base}.{i}.gate_proj.weight_scale"] = scales[i].cpu()
-                        elif "up_proj" in k:
-                            for i in range(n_experts):
-                                output_tensors[f"{base}.{i}.up_proj.weight_packed"] = packed[i].cpu()
-                                output_tensors[f"{base}.{i}.up_proj.weight_scale"] = scales[i].cpu()
+                            parts = [("gate_proj", weight_bf16)]
+                        else:  # up_proj
+                            parts = [("up_proj", weight_bf16)]
+
+                        for emit_proj, w in parts:
+                            res = _scheme_quantize(scheme, w.contiguous(), g_dev, scale_percentile)
+                            for i in range(w.shape[0]):
+                                for suffix, t in res.items():
+                                    output_tensors[f"{base}.{i}.{emit_proj}.{suffix}"] = (
+                                        t[i].contiguous().cpu()
+                                    )
                         n_quantized += 1
                     else:
-                        if isinstance(handler, FusedExpertHandler) and "gate_up_proj" in k:
-                            packed = FusedExpertHandler.interleave_gate_up(packed)
-                            scales = FusedExpertHandler.interleave_gate_up(scales)
-
-                        packed_key, scale_key = handler.output_keys(k)
-                        output_tensors[packed_key] = packed.cpu()
-                        output_tensors[scale_key] = scales.cpu()
+                        res = _scheme_quantize(scheme, weight_bf16, g_dev, scale_percentile)
+                        if isinstance(handler, FusedExpertHandler):
+                            # vLLM-fork fused (w13) layout — mxfp4 only (nvfp4 guarded out).
+                            if "gate_up_proj" in k:
+                                res = {
+                                    s: FusedExpertHandler.interleave_gate_up(t)
+                                    for s, t in res.items()
+                                }
+                            packed_key, scale_key = handler.output_keys(k)
+                            output_tensors[packed_key] = res["weight_packed"].cpu()
+                            output_tensors[scale_key] = res["weight_scale"].cpu()
+                        else:
+                            # Standard 2D: emit `<base>.<suffix>` for every scale tensor.
+                            base = k[: -len(".weight")] if k.endswith(".weight") else k
+                            for suffix, t in res.items():
+                                output_tensors[f"{base}.{suffix}"] = t.contiguous().cpu()
                         n_quantized += 1
 
             else:
@@ -472,7 +505,8 @@ def process_shard(
     gc.collect()
     if device != "cpu" and torch.cuda.is_available():
         torch.cuda.empty_cache()
-    _libc.malloc_trim(0)
+    if _malloc_trim is not None:
+        _malloc_trim(0)
 
     in_mb = os.path.getsize(input_path) / 1e6
     out_mb = os.path.getsize(output_path) / 1e6
